@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pytorch-exercise"
+version = "0.1.0"
+description = "A small, installable Python project for practicing PyTorch."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch"]
+
+[project.scripts]
+pytorch-exercise = "pytorch_exercise.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pytorch_exercise"]
