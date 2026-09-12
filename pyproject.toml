@@ -31,3 +31,18 @@ swarm-mlp = "swarm_mlp.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/swarm_mlp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Integration tests fork real DHT/p2pd processes, so they are opt-in: plain
+# `pytest` is fast and hermetic, `pytest -m integration` runs the slow ones
+# (a -m on the command line replaces this filter rather than adding to it).
+addopts = "-m 'not integration'"
+markers = ["integration: starts real DHT/p2pd processes; slow"]
+filterwarnings = [
+    # hivemind's p2p Client.__del__ touches asyncio during interpreter teardown,
+    # long after every DHT and Server has been shut down explicitly. Cosmetic and
+    # documented in docs/setup.md; the production entry points suppress it via
+    # observability.silence_teardown_noise, which pytest's own hook pre-empts.
+    "ignore:Exception ignored in:pytest.PytestUnraisableExceptionWarning",
+]
