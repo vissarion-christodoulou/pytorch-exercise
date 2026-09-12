@@ -1,36 +1,48 @@
-# pytorch-exercise
+# Distributed MLP training with hivemind
 
-A small, installable Python project for practicing PyTorch.
+A peer-to-peer system that trains a 3-layer MLP on MNIST across two pipeline
+parallel stages, with two data-parallel workers per stage, built on
+[hivemind](https://github.com/learning-at-home/hivemind). `torch.distributed` is
+not used anywhere.
+
+The system has two services:
+
+- **worker** — owns one pipeline stage's weights, serves `forward` and `backward`
+  for that stage, and accumulates gradients locally. When the workers in a stage
+  collectively reach the target batch size they all-reduce gradients and step.
+- **trainer** — holds no weights. It samples data batches and routes
+  activations and gradients between workers.
 
 ## Setup
 
-Create and activate a virtual environment, then install the project:
+Everything runs inside WSL2 Ubuntu. From a WSL shell:
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -e .
+```bash
+./scripts/setup.sh
+source ~/.venvs/pluralis/bin/activate
 ```
 
-## Usage
+See [docs/setup.md](docs/setup.md) for the verified configuration, the reasoning
+behind each choice, and known quirks.
 
-Run the entry point, which prints the installed torch version and whether CUDA is available:
+## Verifying the environment
 
-```powershell
-pytorch-exercise
+```bash
+python scripts/verify_env.py
 ```
 
-Or run it as a module:
-
-```powershell
-python -m pytorch_exercise
-```
+Checks that hivemind imports, that two DHT peers can discover each other over
+libp2p, and that a forward/backward round trip through a remotely hosted module
+returns gradients to the caller.
 
 ## Layout
 
 ```
-src/pytorch_exercise/
-    __init__.py
-    __main__.py    # main(): prints torch version and CUDA availability
+scripts/
+    setup.sh            # idempotent environment bootstrap
+    verify_env.py       # hivemind installation checks
+src/swarm_mlp/
+docs/
+    setup.md
+requirements.lock.txt   # exact pins for the verified environment
 ```

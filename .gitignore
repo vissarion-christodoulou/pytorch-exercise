@@ -22,3 +22,9 @@ dist/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Datasets and run outputs
+data/
+runs/
+*.log
+*.pt

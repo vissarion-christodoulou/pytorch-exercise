@@ -1,0 +1,5 @@
+# The repo lives on the Windows filesystem but every file is consumed inside
+# WSL2. Normalise everything to LF so shell scripts do not fail with
+# "bad interpreter: /usr/bin/env bash^M" and so config files read cleanly there,
+# regardless of the contributor's core.autocrlf setting.
+* text=auto eol=lf
