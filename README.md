@@ -57,9 +57,8 @@ Three properties make it usable as a control rather than just a nice graph:
 - **Densely sampled.** Loss is recorded after every optimiser step, not once per
   epoch. Five points per run cannot separate a subtly wrong all-reduce from
   noise; a few thousand can.
-- **Plotted against samples consumed**, not step count. Four workers stepping on
-  a shared target-batch-size trigger have no step counter corresponding to this
-  one.
+- **Plotted against samples consumed**, not step count. Four workers stepping
+  once per group of batches have no step counter corresponding to this one.
 
 `train_reference()` returns the curve in memory and writes nothing, so the
 eventual comparison script can call it directly.

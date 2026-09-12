@@ -2,35 +2,28 @@
 
 A worker owns a stage's weights and nothing else. It never sees a label, never
 computes a loss, and never decides what data to process - it answers requests.
-The trainer decides what to send; the worker decides when to step.
+The trainer decides what to send *and* when to step; the worker only ever
+accumulates and obeys.
 
-That last split is the whole point of this module. hivemind's ``ModuleBackend``
+That split is the whole point of this module. hivemind's ``ModuleBackend``
 applies its optimiser after *every* backward call, which would make each remote
 micro-batch its own optimiser step. The assignment needs the opposite:
-accumulate locally, and step only once the workers of this stage have
-*collectively* seen a target number of samples - at which point they all-reduce
-their gradients with each other and step together.
+accumulate, and step only once the workers of this stage have *collectively*
+seen a whole group of batches - at which point they all-reduce their gradients
+with each other and step together.
 
-``StageBackend`` below is that inversion, and it has two modes:
+``StageBackend`` below is that inversion. Backwards land in private buffers and
+stay there; the trainer, which dealt the batches and so is the only party that
+knows the group's exact total, signals the round over the control channel. On
+that signal the worker all-reduces with the other replicas of its stage through
+a ``hivemind.optim.GradientAverager`` and steps. Replicas begin from identical
+weights and apply identical averaged gradients, so they stay identical without
+ever exchanging parameters.
 
-* **local** (``grad_averager is None``) - accumulate into private buffers and
-  step on the local sample count. This is a single worker hosting a stage on its
-  own, and it is what reproduces the single-process reference exactly.
-* **averaged** - accumulate into the same private buffers and hold them until
-  the trainer signals the round over the control channel. The trainer dealt the
-  batches, so it is the only party that knows the group's exact total; this
-  worker never estimates it and never decides for itself. On the signal it
-  all-reduces with the other replicas of its stage through a
-  ``hivemind.optim.GradientAverager`` and steps. Replicas begin from identical
-  weights and apply identical averaged gradients, so they stay identical
-  without ever exchanging parameters.
-
-The all-reduce runs on hivemind's Runtime thread, inside ``on_backward``, and it
-blocks. That is deliberate and it is also the sharpest constraint on the system:
-a worker in the middle of an all-reduce is serving nothing. It is safe only
-because the trainer keeps every replica of a stage busy concurrently, so the
-replicas arrive at the barrier together. See ``trainer.py`` for the other half
-of that argument.
+The all-reduce blocks, which is the sharpest constraint on the system: a worker
+in the middle of one is serving nothing. It is safe only because the trainer
+signals every replica of a stage at the same instant, so they arrive at the
+barrier together. See ``trainer.py`` for the other half of that argument.
 """
 
 from __future__ import annotations
@@ -56,29 +49,19 @@ from swarm_mlp.model import STAGE_SHAPES, build_stage
 from swarm_mlp.observability import configure_logging, silence_teardown_noise
 from swarm_mlp.reference import BATCH_SIZE, LEARNING_RATE, SEED
 
-#: Default number of trainer batches a stage accumulates, collectively across
-#: its replicas, before all-reducing. The operator sets the threshold in
-#: *samples* (`--target-batch-size`); this is only the default multiplier used
-#: when they give `--batches-per-reduce` instead.
-BATCHES_PER_REDUCE = 10
-
-
 class StageBackend(ModuleBackend):
-    """A pipeline stage that accumulates gradients and steps at a target batch size.
+    """A pipeline stage that accumulates gradients and steps when it is told to.
 
     hivemind's ``ModuleBackend.on_backward`` steps the optimiser after every
-    backward call. This subclass accumulates instead. Alone, it steps once it
-    has seen ``target_batch_size`` samples itself. Given a ``GradientAverager``
-    it never decides at all: it steps when the trainer calls ``reduce_now``.
-
-    ``target_batch_size`` is therefore read in local mode *only*. In averaged
-    mode the threshold lives in the trainer, which is the only party that can
-    see what the whole group has processed.
+    backward call. This subclass accumulates instead and never decides to step
+    on its own: ``reduce_now`` is the only path to the optimiser, and only the
+    trainer calls it. The threshold lives in the trainer because the trainer is
+    the only party that can see what the whole group has processed.
 
     The optimiser is held here rather than passed to ``ModuleBackend.__init__``
     so that no base-class code path can reach it: the base class treats an
-    optimiser as something to step, and this class treats it as something to
-    step *on a schedule*.
+    optimiser as something to step, and this class treats it as something only
+    a reduce signal may step.
     """
 
     def __init__(
@@ -87,10 +70,9 @@ class StageBackend(ModuleBackend):
         module: nn.Module,
         *,
         optimizer: torch.optim.Optimizer,
-        target_batch_size: int,
         args_schema: tuple[BatchTensorDescriptor, ...],
         outputs_schema: BatchTensorDescriptor,
-        grad_averager: GradientAverager | None = None,
+        grad_averager: GradientAverager,
         averaging_timeout: float = 120.0,
         **pool_kwargs,
     ) -> None:
@@ -103,10 +85,8 @@ class StageBackend(ModuleBackend):
             **pool_kwargs,
         )
         self.optimizer = optimizer
-        self.target_batch_size = target_batch_size
         self.grad_averager = grad_averager
         self.averaging_timeout = averaging_timeout
-        self.local_epoch = 0
         # Set before the averager is torn down. The Server thread
         # can still deliver a backward after that point, and touching a dead
         # averager blocks forever on an MPFuture whose owner process is gone.
@@ -116,9 +96,9 @@ class StageBackend(ModuleBackend):
         # lock. It is nearly uncontended in practice: the trainer only signals a
         # reduce once every backward of the group has returned.
         self._step_lock = threading.RLock()
-        #: set by serve() in push mode; owns the thread serving rpc_reduce_now
+        #: set by serve(); owns the thread serving rpc_reduce_now
         self.control: object | None = None
-        #: last round id the trainer successfully drove us through (push mode)
+        #: last round id the trainer successfully drove us through
         self.last_round = -1
         self.missed_rounds = 0
 
@@ -148,20 +128,16 @@ class StageBackend(ModuleBackend):
         # setup, and a backend constructed inside a test must not reconfigure it.
         self._logger = get_logger(f"swarm_mlp.worker.{name}")
 
-    @property
-    def averaging_enabled(self) -> bool:
-        return self.grad_averager is not None
-
     def on_backward(self, batch_size: int) -> None:
-        """Accumulate this call's gradients; step if the target has been reached.
+        """Accumulate this call's gradients. Never steps.
 
         Called by hivemind's ``Runtime`` loop, which runs in the Server thread of
         the main process. It is the only caller on that thread, but the control
         channel can call ``reduce_now`` on another, so ``_step_lock`` guards the
         accumulators and counters below.
 
-        Worker accumulates gradients until the trainer - which dealt the batches and therefore
-        knows the exact total - tells it the group is complete.
+        The gradients stay here until the trainer - which dealt the batches and
+        therefore knows the exact total - says the group is complete.
 
         **Why the gradients are weighted by ``batch_size``.** The trainer's loss
         uses ``reduction="mean"``, so the gradient arriving from each backward is
@@ -169,10 +145,7 @@ class StageBackend(ModuleBackend):
         16-sample and a 48-sample batch and halving them would weight the small
         batch three times too heavily. Scaling each by its own batch size and
         dividing the total by the sample count reproduces exactly the gradient of
-        the mean loss over all of them. ``GradientAverager`` normalises the same
-        way - ``accumulate_grads_`` scales by ``batch_size / anchor_batch_size``
-        and ``load_accumulators_into_averager_`` divides by the number of
-        accumulations - so the two modes agree.
+        the mean loss over all of them.
         """
         with self._step_lock:
             self._on_backward_locked(batch_size)
@@ -182,48 +155,16 @@ class StageBackend(ModuleBackend):
         self.samples_total += batch_size
         self.backward_calls += 1
 
-        if self.averaging_enabled and self._stopping.is_set():
+        if self._stopping.is_set():
             return  # shutting down: accumulate nothing, join no barrier
 
-        if self.averaging_enabled:
-            self._accumulate_locally(batch_size)
-            return
-        else:
-            self._accumulate_locally(batch_size)
-            # `>=` with a reset to zero, not `% target == 0` and not a carried-over
-            # remainder. Modulo on a running total only fires when batch sizes divide
-            # the target exactly - with variable batches (which hivemind's TaskPool
-            # produces by aggregating whatever requests arrive together) it silently
-            # skips most steps. Carrying a remainder forward would be wrong too: the
-            # gradient for those samples has just been applied.
-            if self.samples_since_step < self.target_batch_size:
-                return
-            self._step_locally()
+        self._accumulate(batch_size)
 
-    # ------------------------------------------------------------------ local
-
-    def _accumulate_locally(self, batch_size: int) -> None:
+    def _accumulate(self, batch_size: int) -> None:
         for param, accumulator in zip(self._params, self._accumulators):
             if param.grad is not None:
                 accumulator.add_(param.grad, alpha=float(batch_size))
                 param.grad = None
-
-    def _step_locally(self) -> None:
-        sum_of_squares = 0.0
-        for param, accumulator in zip(self._params, self._accumulators):
-            param.grad = accumulator / self.samples_since_step
-            sum_of_squares += float(param.grad.pow(2).sum())
-        self.last_grad_norm = math.sqrt(sum_of_squares)
-
-        self.optimizer.step()
-
-        for param, accumulator in zip(self._params, self._accumulators):
-            param.grad = None
-            accumulator.zero_()
-
-        self._finish_step(self.samples_since_step, group_size=1)
-
-    # --------------------------------------------------------------- averaged
 
     def reduce_now(self, round_id: int = -1) -> dict:
         """All-reduce and step because the trainer says the group is complete.
@@ -233,8 +174,6 @@ class StageBackend(ModuleBackend):
         ack, so a caller can tell a real round from a no-op.
         """
         with self._step_lock:
-            if not self.averaging_enabled:
-                return {"reduced": False, "reason": "averaging is disabled on this worker"}
             if self._stopping.is_set():
                 return {"reduced": False, "reason": "worker is shutting down"}
             if self.samples_since_step == 0:
@@ -295,9 +234,9 @@ class StageBackend(ModuleBackend):
         # and nothing ever pulls them back together (measured: 6.3e-3 drift
         # where averaging gives <1e-6). Whether we averaged is decided by the
         # averaging result below, never by a guess made beforehand. A genuinely
-        # solo stage should be run with --no-averaging; if it is not, the round
-        # fails on the timeout and is reported rather than silently corrupting
-        # the weights.
+        # stage with only one replica running cannot close a group at all, and
+        # the round fails on the timeout and is reported rather than silently
+        # corrupting the weights.
 
         # Finish the mean ourselves, then give the averager a single
         # accumulation of it: with one call the anchor equals the batch size and
@@ -308,14 +247,15 @@ class StageBackend(ModuleBackend):
         self.grad_averager.accumulate_grads_(batch_size=local_samples)
 
         # Blocks until the other replicas of this stage arrive at the same
-        # barrier. `weight` defaults to local_samples_accumulated, so a replica
-        # that processed more samples counts proportionally more - which is what
-        # keeps the averaged gradient equal to the gradient of the mean loss over
-        # every sample the group saw, however unevenly they were split.
-        # step() also loads the accumulators into the averager and resets them.
+        # barrier. step() also loads the accumulators into the averager and
+        # resets them.
         try:
-            # weight= is explicit rather than relying on the averager's own
-            # sample counter, which we no longer drive call-by-call.
+            # weight= is passed explicitly rather than left to default to the
+            # averager's own local_samples_accumulated, which we no longer drive
+            # call-by-call. It is what makes a replica that processed more
+            # samples count proportionally more, and so what keeps the averaged
+            # gradient equal to the gradient of the mean loss over every sample
+            # the group saw, however unevenly they were split.
             # The return value is the gathered data from everyone in the group,
             # so its length is the REAL group size. Nothing cheaper is: a
             # DHT-gossiped peer count was quietly reporting 2 on rounds that
@@ -360,13 +300,13 @@ class StageBackend(ModuleBackend):
                 # averaged before is having a bad round, not a bad config.
                 ""
                 if self.last_group_size >= 2
-                else " - this stage has never averaged with a peer; run it with "
-                "--no-averaging if it is meant to be the only replica",
+                else " - this stage has never averaged with a peer; check that "
+                "another replica of it is running and was given the same "
+                "--initial-peers",
             )
             self.grad_averager.reset_accumulated_grads_()
             self._reset_accumulators()
             self.failed_rounds += 1
-            self._advance_epoch()
             self.samples_since_step = 0
             return
 
@@ -378,9 +318,6 @@ class StageBackend(ModuleBackend):
             self.optimizer.step()
 
         self._reset_accumulators()
-
-        self._advance_epoch()
-
         self.averaging_rounds += 1
         if group_size < 2:
             # Averaging "succeeded" with nobody else in the group, so this step
@@ -396,45 +333,27 @@ class StageBackend(ModuleBackend):
 
     # ----------------------------------------------------------------- shared
 
-    def _advance_epoch(self) -> None:
-        """Move to the next round.
-
-        The epoch is local bookkeeping only. Replicas stay in step because the
-        trainer signals every round to all of them at once, not because they
-        share a counter anywhere.
-        """
-        self.local_epoch += 1
-
     def _reset_accumulators(self) -> None:
         for param, accumulator in zip(self._params, self._accumulators):
             param.grad = None
             accumulator.zero_()
 
-    def _finish_step(self, effective_batch: int, *, group_size: int, local_samples: int | None = None) -> None:
+    def _finish_step(self, effective_batch: int, *, group_size: int, local_samples: int) -> None:
         self.steps += 1
         self.last_effective_batch = effective_batch
         self.last_group_size = group_size
         self.samples_since_step = 0
 
-        if local_samples is None:
-            self._logger.info(
-                "step %d  effective_batch %d  samples_total %d  grad_norm %.4f",
-                self.steps,
-                self.last_effective_batch,
-                self.samples_total,
-                self.last_grad_norm,
-            )
-        else:
-            self._logger.info(
-                "step %d  all-reduced with %d peers  group_batch %d (ours %d)  "
-                "samples_total %d  grad_norm %.4f",
-                self.steps,
-                group_size,
-                effective_batch,
-                local_samples,
-                self.samples_total,
-                self.last_grad_norm,
-            )
+        self._logger.info(
+            "step %d  all-reduced with %d peers  group_batch %d (ours %d)  "
+            "samples_total %d  grad_norm %.4f",
+            self.steps,
+            group_size,
+            effective_batch,
+            local_samples,
+            self.samples_total,
+            self.last_grad_norm,
+        )
 
     def shutdown_averaging(self, shutdown_grace: float = 15.0) -> None:
         """Stop the control channel and averager, in that order.
@@ -468,11 +387,10 @@ class StageBackend(ModuleBackend):
     def _shutdown_collectives(self) -> None:
         if self.control is not None:
             self.control.shutdown()
-        if self.grad_averager is not None:
-            self.grad_averager.shutdown()
+        self.grad_averager.shutdown()
 
     def get_stats(self) -> dict[str, int]:
-        """Counters for logging and tests. Nothing in the system reads these yet."""
+        """Counters for the periodic report under ``--stats-interval``, and for tests."""
         return {
             "steps": self.steps,
             "samples_total": self.samples_total,
@@ -494,14 +412,12 @@ def serve(
     initial_peers: Sequence[str] = (),
     host_maddrs: Sequence[str] = ("/ip4/127.0.0.1/tcp/0",),
     identity_path: str | None = None,
-    target_batch_size: int = BATCH_SIZE,
     learning_rate: float = LEARNING_RATE,
     seed: int = SEED,
     num_handlers: int = 2,
     update_period: float = 5.0,
     stats_interval: float | None = None,
     max_batch_size: int = BATCH_SIZE,
-    averaging: bool = False,
     min_matchmaking_time: float = 2.0,
     request_timeout: float = 1.0,
     target_group_size: int | None = None,
@@ -509,13 +425,15 @@ def serve(
 ) -> tuple[hivemind.DHT, Server, StageBackend]:
     """Start a worker hosting ``<stage>.<index>`` and return its parts.
 
-    With ``averaging=True`` the worker also joins the all-reduce group for its
-    stage and stops deciding when to step: the trainer signals each round over
-    the control channel, and two replicas sharing a stage each contribute
-    whatever they were dealt before they average and step together.
-    ``target_batch_size`` is inert in that mode - the trainer's
-    ``--batches-per-reduce`` is the real threshold. It governs the step
-    interval only under ``averaging=False``.
+    The worker joins the all-reduce group for its stage and waits to be told
+    when to step: the trainer signals each round over the control channel, and
+    the replicas sharing a stage each contribute whatever they were dealt
+    before they average and step together. Nothing here decides the interval -
+    that is the trainer's ``--batches-per-reduce``.
+
+    A stage needs at least two replicas serving it. hivemind's matchmaking will
+    not close a group of one, so a lone worker accumulates, is signalled, and
+    times out the round.
 
     The caller owns the lifetime: call ``server.shutdown()`` to stop, which also
     shuts down the DHT it was given, and ``backend.shutdown_averaging()``.
@@ -523,12 +441,12 @@ def serve(
     uid = f"{stage}.{index}"
     if not is_valid_uid(uid):
         raise ValueError(f"{uid!r} is not a valid hivemind expert uid (expected <prefix>.<int>)")
-    if averaging and request_timeout >= min_matchmaking_time:
+    if request_timeout >= min_matchmaking_time:
         raise ValueError(
             f"request_timeout ({request_timeout}) must be smaller than min_matchmaking_time "
             f"({min_matchmaking_time}) or averaging rounds will fail; see hivemind's Matchmaking docstring"
         )
-    if averaging and min_matchmaking_time >= averaging_timeout:
+    if min_matchmaking_time >= averaging_timeout:
         # DecentralizedAverager.step asserts scheduled_time < deadline, where
         # scheduled_time is now + min_matchmaking_time and deadline is now +
         # timeout, so this combination fails every round before any network work.
@@ -550,54 +468,51 @@ def serve(
         dht_kwargs["identity_path"] = identity_path
     dht = hivemind.DHT(**dht_kwargs)
 
-    grad_averager = None
-    if averaging:
-        # Both keys are namespaced by stage, so stage0's replicas form one
-        # all-reduce group and stage1's form another. They never mix.
-        grad_averager = GradientAverager(
-            module.parameters(),
-            dht=dht,
-            prefix=f"{stage}_grads",
-            # hivemind's default is 5s of matchmaking per round, which dominates
-            # wall-clock on a local run that averages every few hundred samples.
-            # It cannot be lowered blindly though: hivemind requires
-            # request_timeout < min_matchmaking_time and warns that otherwise
-            # "matchmaking can cause deadlocks". Lowering only the matchmaking
-            # window inverted that ordering against the 3s default request
-            # timeout, and rounds duly started failing - so both move together.
-            min_matchmaking_time=min_matchmaking_time,
-            request_timeout=request_timeout,
-            # Set this to the number of replicas hosting the stage and an
-            # all-reduce round closes the moment they have all arrived, instead
-            # of waiting out the declared expiration: hivemind's shortcut in
-            # matchmaking.py is guarded by `target_group_size is not None and
-            # len(followers) + 1 >= it`, so the default of None disables it.
-            #
-            # It is a big win and a real risk, and which one you get depends
-            # entirely on how tightly the replicas arrive. Measured on the 2x2
-            # topology:
-            #   batches_per_reduce=10, 60 batches
-            #     None -> 110.66s, 4 of 8 rounds failed on timeout
-            #     2    ->   3.38s, 16 of 16 rounds clean        (32x faster)
-            #   batches_per_reduce=4, 24 batches (the integration test)
-            #     None -> passes
-            #     2    -> AllreduceException: could not find a group
-            #
-            # The difference is arrival skew. None tolerates a late replica by
-            # waiting; a target group size turns that wait into a hard failure.
-            # So this stays off by default until the trainer synchronises
-            # arrival - at which point it is the single largest speedup
-            # available, since averaging is ~90% of wall clock.
-            target_group_size=target_group_size,
-            start=True,
-        )
+    # The key is namespaced by stage, so stage0's replicas form one all-reduce
+    # group and stage1's form another. They never mix.
+    grad_averager = GradientAverager(
+        module.parameters(),
+        dht=dht,
+        prefix=f"{stage}_grads",
+        # hivemind's default is 5s of matchmaking per round, which dominates
+        # wall-clock on a local run that averages every few hundred samples.
+        # It cannot be lowered blindly though: hivemind requires
+        # request_timeout < min_matchmaking_time and warns that otherwise
+        # "matchmaking can cause deadlocks". Lowering only the matchmaking
+        # window inverted that ordering against the 3s default request
+        # timeout, and rounds duly started failing - so both move together.
+        min_matchmaking_time=min_matchmaking_time,
+        request_timeout=request_timeout,
+        # Set this to the number of replicas hosting the stage and an
+        # all-reduce round closes the moment they have all arrived, instead
+        # of waiting out the declared expiration: hivemind's shortcut in
+        # matchmaking.py is guarded by `target_group_size is not None and
+        # len(followers) + 1 >= it`, so the default of None disables it.
+        #
+        # It is a big win and a real risk, and which one you get depends
+        # entirely on how tightly the replicas arrive. Measured on the 2x2
+        # topology:
+        #   batches_per_reduce=10, 60 batches
+        #     None -> 110.66s, 4 of 8 rounds failed on timeout
+        #     2    ->   3.38s, 16 of 16 rounds clean        (32x faster)
+        #   batches_per_reduce=4, 24 batches (the integration test)
+        #     None -> passes
+        #     2    -> AllreduceException: could not find a group
+        #
+        # The difference is arrival skew. None tolerates a late replica by
+        # waiting; a target group size turns that wait into a hard failure.
+        # So this stays off by default until the trainer synchronises
+        # arrival - at which point it is the single largest speedup
+        # available, since averaging is ~90% of wall clock.
+        target_group_size=target_group_size,
+        start=True,
+    )
 
     in_shape, out_shape = STAGE_SHAPES[stage]
     backend = StageBackend(
         uid,
         module,
         optimizer=torch.optim.Adam(module.parameters(), lr=learning_rate),
-        target_batch_size=target_batch_size,
         args_schema=(BatchTensorDescriptor(*in_shape),),
         outputs_schema=BatchTensorDescriptor(*out_shape),
         grad_averager=grad_averager,
@@ -628,23 +543,14 @@ def serve(
         start=True,
     )
 
-    if averaging:
-        # Registered here, in the worker's MAIN process, so the handler shares
-        # memory with the Runtime thread that owns the accumulators. See the
-        # module docstring in control.py for why a ConnectionHandler cannot.
-        backend.control = ControlServer(dht, backend, uid)
-        backend.control.start()
+    # Registered here, in the worker's MAIN process, so the handler shares
+    # memory with the Runtime thread that owns the accumulators. See the module
+    # docstring in control.py for why a ConnectionHandler cannot.
+    backend.control = ControlServer(dht, backend, uid)
+    backend.control.start()
 
     logger.info("hosting %s (%d parameters)", uid, sum(p.numel() for p in module.parameters()))
-    if averaging:
-        # target_batch_size is deliberately absent here: it is inert in this
-        # mode, and printing it beside "all-reduce group" invites the reader to
-        # believe this worker is counting toward it. The trainer owns that.
-        logger.info("all-reduce group %r, rounds triggered by the trainer", stage)
-    else:
-        logger.info(
-            "averaging disabled (solo stage), stepping every %d samples", target_batch_size
-        )
+    logger.info("all-reduce group %r, rounds triggered by the trainer", stage)
     logger.info("peer id %s, dht child pid %s", dht.peer_id, dht.pid)
     logger.info("trainers join with: --initial-peers %s", dht.get_visible_maddrs()[0])
 
@@ -662,23 +568,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--host-maddrs", nargs="*", default=["/ip4/127.0.0.1/tcp/0"])
     parser.add_argument("--identity-path", default=None, help="private key file for a stable PeerID")
     parser.add_argument(
-        "--target-batch-size",
-        type=int,
-        default=None,
-        help="samples to accumulate before stepping. Applies to --no-averaging "
-        "only: with averaging on, the trainer signals every round and this is "
-        f"ignored (default: --batches-per-reduce x {BATCH_SIZE})",
-    )
-    parser.add_argument(
-        "--batches-per-reduce",
-        type=int,
-        default=BATCHES_PER_REDUCE,
-        help=f"batches per step; sets the target to N x {BATCH_SIZE} samples "
-        f"(default: {BATCHES_PER_REDUCE}). Ignored if --target-batch-size is "
-        "given, and ignored entirely unless --no-averaging - set the interval "
-        "on the trainer instead.",
-    )
-    parser.add_argument(
         "--batch-size",
         type=int,
         default=BATCH_SIZE,
@@ -689,11 +578,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--num-handlers", type=int, default=2)
     parser.add_argument("--update-period", type=float, default=5.0)
-    parser.add_argument(
-        "--no-averaging",
-        action="store_true",
-        help="run this stage solo: accumulate and step locally, never all-reduce",
-    )
     parser.add_argument(
         "--min-matchmaking-time",
         type=float,
@@ -724,10 +608,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="seconds between throughput reports (hivemind's and ours); off by default",
     )
     parser.add_argument("--log-level", default=None)
-    args = parser.parse_args(argv)
-    if args.target_batch_size is None:
-        args.target_batch_size = args.batches_per_reduce * args.batch_size
-    return args
+    return parser.parse_args(argv)
 
 
 def main() -> None:
@@ -741,14 +622,12 @@ def main() -> None:
         initial_peers=args.initial_peers,
         host_maddrs=args.host_maddrs,
         identity_path=args.identity_path,
-        target_batch_size=args.target_batch_size,
         learning_rate=args.learning_rate,
         seed=args.seed,
         num_handlers=args.num_handlers,
         update_period=args.update_period,
         stats_interval=args.stats_interval,
         max_batch_size=args.batch_size,
-        averaging=not args.no_averaging,
         min_matchmaking_time=args.min_matchmaking_time,
         request_timeout=args.request_timeout,
         target_group_size=args.target_group_size,

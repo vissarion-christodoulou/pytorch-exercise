@@ -47,7 +47,7 @@ def configure_logging(role: str, level: str | None = None) -> logging.Logger:
     line twice. Entry points call it; library code calls ``get_logger`` and
     inherits whatever the entry point configured.
 
-    :param role: short provenance tag, e.g. ``"worker[full.0]"`` or ``"trainer"``.
+    :param role: short provenance tag, e.g. ``"worker[stage0.0]"`` or ``"trainer"``.
     :param level: overrides ``HIVEMIND_LOGLEVEL``; defaults to INFO.
     """
     # hivemind's handler is installed on the `hivemind` logger by default and

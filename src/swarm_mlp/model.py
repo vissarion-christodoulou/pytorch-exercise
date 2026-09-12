@@ -71,7 +71,6 @@ def build_model(seed: int, device: str = "cpu") -> SimpleMLP:
 # only, never shapes, so a wrong shape would otherwise fail obscurely on the
 # far side of an RPC.
 STAGE_SHAPES: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {
-    "full": ((1, 28, 28), (10,)),
     "stage0": ((1, 28, 28), (256,)),
     "stage1": ((256,), (10,)),
 }
@@ -80,9 +79,8 @@ STAGE_SHAPES: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {
 def build_stage(stage: str, seed: int, device: str = "cpu") -> nn.Module:
     """The module a worker for ``stage`` hosts, deterministically initialised.
 
-    ``"full"`` is the entire ``SimpleMLP``, which is how a single worker can
-    reproduce the reference exactly. ``"stage0"`` and ``"stage1"`` are the two
-    halves of that same model, carved at the fc1/fc2 boundary:
+    ``"stage0"`` and ``"stage1"`` are the two halves of one ``SimpleMLP``,
+    carved at the fc1/fc2 boundary:
 
         stage0:  Flatten -> fc1 -> relu1     (1, 28, 28) -> (256,)
         stage1:  fc2 -> relu2 -> fc3         (256,)      -> (10,)
@@ -103,8 +101,6 @@ def build_stage(stage: str, seed: int, device: str = "cpu") -> nn.Module:
     # weights stop matching the reference's.
     model = build_model(seed, device=device)
 
-    if stage == "full":
-        return model
     if stage == "stage0":
         # nn.Sequential holds references to the very modules `model` built, so
         # these are the reference's parameter tensors, not copies of them.

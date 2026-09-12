@@ -26,9 +26,9 @@ from typing import Any
 class LossCurve:
     """A training run's loss against the number of samples consumed.
 
-    The x-axis is *samples*, not optimiser steps. Four workers stepping on a
-    shared target-batch-size trigger have no step counter that corresponds to
-    the reference's; samples consumed is the axis both sides can agree on.
+    The x-axis is *samples*, not optimiser steps. Four workers stepping once per
+    group of batches have no step counter that corresponds to the reference's;
+    samples consumed is the axis both sides can agree on.
     """
 
     samples: list[int] = field(default_factory=list)

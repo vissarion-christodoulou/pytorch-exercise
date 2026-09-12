@@ -1,8 +1,13 @@
-"""StageBackend's accumulate-then-step policy, driven without any network.
+"""StageBackend's accumulation, driven without any network.
 
 ``ModuleBackend.backward`` is the entry point hivemind's Runtime uses, and it
 can be called directly: constructing a backend creates its task pools but does
 not start them, so these tests spawn no processes.
+
+A worker never steps on its own - only ``reduce_now`` reaches the optimiser, and
+only the trainer calls that - so what is testable without a network is the
+accumulation and the guards around it. The stepping itself is covered by the
+integration tests in ``test_pipeline.py``, which run real peers.
 
 Each test feeds gradients of exactly the shape the trainer sends - the gradient
 of a ``reduction="mean"`` cross-entropy with respect to the logits - because the
@@ -22,14 +27,23 @@ from hivemind.utils import BatchTensorDescriptor
 
 from swarm_mlp.worker import StageBackend
 
-IN_FEATURES, OUT_FEATURES, TARGET = 4, 3, 64
+IN_FEATURES, OUT_FEATURES, BATCH = 4, 3, 64
+
+
+class _StubAverager:
+    """A sentinel, not a fake.
+
+    A backend needs a ``GradientAverager`` to exist, but every path these tests
+    reach returns before touching it. A fuller fake would only invite the reader
+    to believe the test exercises hivemind's averaging, which it does not - that
+    lives in ``test_pipeline.py``, over a real DHT.
+    """
 
 
 def make_backend(
     seed: int = 0,
     optimizer_cls=torch.optim.Adam,
     lr: float = 1e-3,
-    target: int = TARGET,
     max_batch_size: int = 4096,
 ):
     torch.manual_seed(seed)
@@ -38,9 +52,9 @@ def make_backend(
         "test.0",
         module,
         optimizer=optimizer_cls(module.parameters(), lr=lr),
-        target_batch_size=target,
         args_schema=(BatchTensorDescriptor(IN_FEATURES),),
         outputs_schema=BatchTensorDescriptor(OUT_FEATURES),
+        grad_averager=_StubAverager(),
         min_batch_size=1,
         max_batch_size=max_batch_size,
     )
@@ -69,73 +83,30 @@ def test_constructing_a_backend_starts_no_processes():
     assert len(mp.active_children()) == before
 
 
-def test_accumulates_until_target():
-    module, backend = make_backend()
-    inputs, labels = batch(TARGET)
-    before = [p.detach().clone() for p in module.parameters()]
+def test_weighted_accumulation_equals_one_full_batch():
+    """Micro-batches of 16 + 48 must accumulate to exactly what one batch of 64 does.
 
-    backend.backward(inputs[:16], grad_wrt_logits(module, inputs[:16], labels[:16]))
-    assert backend.steps == 0
-    assert backend.samples_since_step == 16
-    assert all(torch.equal(p, q) for p, q in zip(module.parameters(), before))
+    This is the test that pins the sample weighting: the trainer's loss uses
+    ``reduction="mean"``, so each incoming gradient is already divided by its own
+    call's batch size. Replacing ``acc += batch_size * grad`` with a plain sum
+    over calls weights the 16-sample batch three times too heavily.
 
-    backend.backward(inputs[16:], grad_wrt_logits(module, inputs[16:], labels[16:]))
-    assert backend.steps == 1
-    assert backend.samples_since_step == 0
-    assert backend.last_effective_batch == TARGET
-    assert not any(torch.equal(p, q) for p, q in zip(module.parameters(), before))
-    assert all(p.grad is None for p in module.parameters())
-    assert all(not accumulator.any() for accumulator in backend._accumulators)
-
-
-@pytest.mark.parametrize("optimizer_cls,lr", [(torch.optim.Adam, 1e-3), (torch.optim.SGD, 0.1)])
-def test_weighted_mean_equals_full_batch(optimizer_cls, lr):
-    """Micro-batches of 16 + 48 must land exactly where one batch of 64 does.
-
-    This is the test that pins the sample weighting: replacing
-    ``acc += batch_size * grad`` / ``grad = acc / samples`` with a plain mean over
-    calls weights the 16-sample batch three times too heavily, and this fails.
+    Asserted on the accumulator rather than on the weights, because the worker
+    no longer steps on its own - the accumulator *is* what the all-reduce is
+    handed, divided by the sample count, so this is the value that matters.
     """
-    split_module, split_backend = make_backend(optimizer_cls=optimizer_cls, lr=lr)
-    whole_module, whole_backend = make_backend(optimizer_cls=optimizer_cls, lr=lr)
+    split_module, split_backend = make_backend()
+    whole_module, whole_backend = make_backend()
 
-    inputs, labels = batch(TARGET)
+    inputs, labels = batch(BATCH)
     split_backend.backward(inputs[:16], grad_wrt_logits(split_module, inputs[:16], labels[:16]))
     split_backend.backward(inputs[16:], grad_wrt_logits(split_module, inputs[16:], labels[16:]))
     whole_backend.backward(inputs, grad_wrt_logits(whole_module, inputs, labels))
 
-    assert split_backend.steps == whole_backend.steps == 1
-    for split_param, whole_param in zip(split_module.parameters(), whole_module.parameters()):
-        assert torch.allclose(split_param, whole_param, atol=1e-6)
-
-
-def test_oversized_batch_steps_once():
-    module, backend = make_backend()
-    inputs, labels = batch(100)
-    backend.backward(inputs, grad_wrt_logits(module, inputs, labels))
-
-    assert backend.steps == 1
-    assert backend.last_effective_batch == 100
-    assert backend.samples_since_step == 0
-
-
-def test_variable_batches_step_on_threshold_not_modulo():
-    """Guards against `examples_processed % target == 0`, which skips most steps."""
-    module, backend = make_backend(optimizer_cls=torch.optim.SGD, lr=0.1)
-
-    rng = random.Random(0)
-    expected_steps, pending = 0, 0
-    for _ in range(50):
-        size = rng.choice([16, 24, 32, 48])
-        inputs, labels = batch(size, seed=size)
-        backend.backward(inputs, grad_wrt_logits(module, inputs, labels))
-        pending += size
-        if pending >= TARGET:
-            expected_steps += 1
-            pending = 0
-
-    assert backend.steps == expected_steps
-    assert backend.backward_calls == 50
+    assert split_backend.samples_since_step == whole_backend.samples_since_step == BATCH
+    assert split_backend.steps == whole_backend.steps == 0, "neither may step on its own"
+    for split_acc, whole_acc in zip(split_backend._accumulators, whole_backend._accumulators):
+        assert torch.allclose(split_acc, whole_acc, atol=1e-6)
 
 
 def test_get_stats_reports_every_counter():
@@ -175,11 +146,11 @@ def test_backward_pool_is_capped_to_one_trainer_batch():
     gradients go silently wrong in proportion to how many requests happened to
     arrive together - hence this test.
     """
-    _, backend = make_backend(max_batch_size=TARGET)
+    _, backend = make_backend(max_batch_size=BATCH)
     pools = list(backend.get_pools())
     assert pools, "expected the backend to expose its task pools"
     for pool in pools:
-        assert pool.max_batch_size == TARGET
+        assert pool.max_batch_size == BATCH
 
 
 def test_serve_caps_the_pool_at_the_trainer_batch_size_by_default():
@@ -191,18 +162,7 @@ def test_serve_caps_the_pool_at_the_trainer_batch_size_by_default():
     assert inspect.signature(serve).parameters["max_batch_size"].default == BATCH_SIZE
 
 
-class _StubAverager:
-    """Just enough GradientAverager to reach the missed-round branch."""
-
-    def __init__(self):
-        self.local_samples_accumulated = 0  # structurally 0 on this path
-        self.resets = 0
-
-    def reset_accumulated_grads_(self):
-        self.resets += 1
-
-
-def test_push_mode_discards_gradients_when_a_round_was_missed():
+def test_a_missed_round_discards_the_gradients_computed_against_stale_weights():
     """A lost reduce signal means the group stepped without us: drop the batch.
 
     Nothing here shares an epoch counter, so the round id the trainer sends is
@@ -211,7 +171,6 @@ def test_push_mode_discards_gradients_when_a_round_was_missed():
     behind - and would join the round weighted as though they were fresh.
     """
     module, backend = make_backend()
-    backend.grad_averager = _StubAverager()
     backend.last_round = 0
 
     inputs, labels = batch(32)

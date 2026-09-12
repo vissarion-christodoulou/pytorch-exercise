@@ -7,9 +7,9 @@ so everything here exists to make that comparison sharp rather than vague:
 * **Dense sampling.** The loss is recorded after every optimiser step, not once
   per epoch. Five points per run cannot distinguish a subtly wrong all-reduce
   from noise; a few thousand can.
-* **Samples, not steps, on the x-axis.** Four workers stepping on a shared
-  target-batch-size trigger do not have a step counter that corresponds to this
-  one. Samples consumed is the axis both sides can agree on.
+* **Samples, not steps, on the x-axis.** Four workers stepping once per group
+  of batches do not have a step counter that corresponds to this one. Samples
+  consumed is the axis both sides can agree on.
 * **Seeded and reproducible.** Same seed, same initial weights, same batch
   order. If the distributed run starts from the same place and follows the same
   data, the curves should nearly coincide - a much stronger test than "both

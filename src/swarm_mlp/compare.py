@@ -33,7 +33,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="a saved reference curve; recomputed from the distributed run's metadata if omitted",
     )
-    parser.add_argument("--output", type=Path, default=RESULTS_DIR / "compare_step2.png")
+    parser.add_argument("--output", type=Path, default=RESULTS_DIR / "compare_pipeline.png")
     parser.add_argument("--tolerance", type=float, default=1e-3)
     parser.add_argument("--smooth", type=int, default=50)
     parser.add_argument("--log-level", default=None)
@@ -99,7 +99,7 @@ def main() -> int:
         args.output,
         smooth=args.smooth,
         tolerance=args.tolerance,
-        title="Distributed (one worker, full model) vs single-process reference",
+        title="Distributed pipeline vs single-process reference",
     )
     print(f"plot written to {written}")
 
