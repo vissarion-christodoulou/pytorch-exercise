@@ -96,6 +96,16 @@ ACTUAL="$(git -C "$HIVEMIND_SRC" rev-parse HEAD)"
 log "Installing hivemind from source"
 "$UV_BIN" pip install --python "$VENV_PY" --no-build-isolation --no-deps "$HIVEMIND_SRC"
 
+# --- this project -----------------------------------------------------------
+# Editable, so source edits take effect without reinstalling. This matters more
+# than usual here: workers and trainers run as separate processes (and hivemind
+# forks more beneath them), so the package has to be importable regardless of
+# each process's working directory.
+# --no-deps again, because the lockfile is the source of truth for versions and
+# pyproject.toml deliberately omits hivemind.
+log "Installing this project (editable)"
+"$UV_BIN" pip install --python "$VENV_PY" --no-deps -e "$REPO_ROOT"
+
 # --- verify ------------------------------------------------------------------
 if [[ "$SKIP_VERIFY" -eq 1 ]]; then
     log "Skipping verification (--skip-verify)"

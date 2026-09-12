@@ -77,12 +77,29 @@ small files a venv contains, and prone to file-locking errors mid-install. The
 venv lives on the Linux filesystem at `~/.venvs/pluralis` instead. `setup.sh`
 rejects a `VENV_DIR` under `/mnt/`.
 
+## pyproject.toml vs requirements.lock.txt vs setup.sh
+
+Three files that all look like "dependencies" but answer different questions:
+
+| File | Question it answers |
+|---|---|
+| `pyproject.toml` | *What is this package?* Its name, its importable layout, its entry points, and what it depends on in the abstract. |
+| `requirements.lock.txt` | *Which exact versions are known to work?* Pins for the whole transitive tree, generated from a verified venv. |
+| `scripts/setup.sh` | *How do I construct the environment?* The ordering and flags needed to get from a bare Ubuntu to a working install. |
+
+`setup.sh` builds the environment; `pyproject.toml` is what makes `src/pytorch_exercise/` importable at all, since a `src/` layout is not on `sys.path` by default. The last step of `setup.sh` installs this project **editable** (`pip install -e`), so source edits take effect immediately and any process can import the package regardless of its working directory — which matters because workers and trainers run as separate processes, with hivemind forking more beneath them.
+
+Both the hivemind and project installs pass `--no-deps`, because `requirements.lock.txt` is the single source of truth for versions. The dependency list in `pyproject.toml` is therefore declarative: it documents what the package needs, but does not drive what gets installed.
+
+`pyproject.toml` deliberately does **not** list hivemind. Naming it would make a normal resolve fetch an unrelated release from PyPI, whereas the assignment mandates one specific git hash built with `--no-build-isolation`.
+
 ## What `verify_env.py` proves
 
 Three checks, cheapest first, so a failure points at the right layer:
 
-1. **imports and p2pd binary** — hivemind and torch import, and the daemon binary
-   exists and is executable.
+1. **imports and p2pd binary** — hivemind and torch import, the daemon binary
+   exists and is executable, and this project's package is importable by name
+   (proving the editable install landed, not just that the repo is the cwd).
 2. **DHT peer discovery** — two DHT peers find each other over real libp2p; one
    stores a value, the other reads it back. This is the discovery path a trainer
    uses to locate workers.
