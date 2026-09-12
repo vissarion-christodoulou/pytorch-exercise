@@ -55,9 +55,8 @@ class StageControl(ServicerBase):
     handlers under its own protocol name.
     """
 
-    def __init__(self, backend: Any, uid: str) -> None:
+    def __init__(self, backend: Any) -> None:
         self.backend = backend
-        self.uid = uid
 
     async def rpc_reduce_now(
         self, request: runtime_pb2.ExpertRequest, context: P2PContext
@@ -89,7 +88,7 @@ class ControlServer:
     def __init__(self, dht: Any, backend: Any, uid: str) -> None:
         self._dht = dht
         self._uid = uid
-        self._servicer = StageControl(backend, uid)
+        self._servicer = StageControl(backend)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()

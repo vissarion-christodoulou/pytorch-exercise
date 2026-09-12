@@ -1,34 +1,31 @@
 """The trainer service: samples data and routes it through the workers.
 
 The trainer holds no weights, no optimiser and no gradients of its own. It owns
-the dataset and the loss, and that is all. Everything it does is visible in the
-inner loop: pull a batch, call the remote stage, compute cross-entropy against
-the labels, and call ``.backward()``.
+1) the dataset
+2) the loss
+3) the worker load balancing
+4) when each stage all-reduces
+
+At any given point it holds a queue of available workers per stage and assigns
+them batches. It computes the loss when a last-stage worker completes a forward
+pass, and calls ``.backward()``.
 
 That last call is doing more than it appears to. ``logits`` came out of
 hivemind's ``RemoteExpert``, whose forward is an ``autograd.Function``, so
 ``loss.backward()`` issues a *remote* backward RPC carrying the saved inputs and
 the gradient of the loss with respect to the logits. The worker recomputes its
-forward, backpropagates into its own parameters, accumulates, and - on its own
-schedule, not the trainer's - steps. The input gradients it returns are
-discarded here; with a second stage they become the gradients flowing further
-back up the pipeline.
+forward, backpropagates into its own parameters and accumulates. The input
+gradients become the gradients flowing further back up the pipeline.
 
-With two stages and two replicas each, ``train_pipeline`` below drives one
-*lane* per replica index: lane r sends its batch through ``stage0.r`` and then
-``stage1.r``, and the lanes run concurrently. That concurrency is not an
-optimisation, it is a correctness requirement. A worker all-reduces inside
-``on_backward`` and blocks there until its same-stage peer arrives at the same
-barrier. If the trainer drove one batch at a time, the first replica to reach
-the threshold would wait for a peer that is not being sent any work, and the run
-would stall until the averaging timeout. Keeping every replica fed is what makes
-the barrier close.
+The workers only step when the trainer tells them to, which it does once a whole
+group of batches has been through both the forward and the backward pass.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 from contextlib import asynccontextmanager
 import time
 from pathlib import Path
@@ -101,7 +98,10 @@ class StagePool:
         self._free = list(range(len(self.experts)))
         #: batches handled per replica; the load-balance evidence
         self.handled = [0] * len(self.experts)
-        self.waits = 0
+        #: poll iterations spent with every replica busy. Times POLL_INTERVAL
+        #: this is roughly how long batches sat waiting for a free worker, which
+        #: is the number that says whether this stage is the bottleneck.
+        self.polls_blocked = 0
 
     async def _claim(self, pin: int | None) -> int:
         while True:
@@ -111,7 +111,7 @@ class StagePool:
             elif pin in self._free:
                 self._free.remove(pin)
                 return pin
-            self.waits += 1
+            self.polls_blocked += 1
             await asyncio.sleep(POLL_INTERVAL)
 
     @asynccontextmanager
@@ -152,31 +152,34 @@ async def train_pipeline(
     **Scheduling.** Batches are processed in groups of ``batches_per_reduce``,
     which is the unit the workers all-reduce over. Inside a group every batch is
     its own coroutine: it takes any free replica of stage0, hands the activations
-    to any free replica of stage1, computes the loss, and calls backward. The
-    group ends when all of its batches have finished their backward pass, by
-    which point each stage has crossed its collective threshold and averaged.
+    to any free replica of stage1, computes the loss, and calls backward. When
+    every batch in the group has finished its backward pass, the trainer signals
+    each worker to all-reduce and step.
 
     Forward and backward are fused per batch rather than run as two phases over
     the group. Since no worker steps until the threshold is crossed, every batch
     in a group sees identical weights either way - the two are numerically the
     same, and fusing avoids holding a group's worth of autograd graphs open.
 
-    **Why the first few batches of each group are pinned.** A worker reaches its
-    all-reduce only from inside ``on_backward``, so a replica that was handed no
-    work in a group never calls ``step()`` - and its peer, which did cross the
-    threshold, blocks at a barrier that can no longer close. Free selection alone
-    permits exactly that (a fast replica taking all ten batches), so each group
-    deals its first ``replicas`` batches round-robin, one to each replica, and
-    only then lets the rest go to whoever is idle. Load-aware for the bulk,
-    guaranteed to close for the barrier.
+    **Why the first few batches of each group are pinned.** A worker handed no
+    work in a group declines the reduce signal - it has nothing to contribute,
+    and a group in which every peer has weight zero makes hivemind divide by
+    zero and produce NaN gradients in silence. But its peer, which does have
+    samples, then sits in matchmaking waiting for a replica that is never
+    coming, and burns the full averaging timeout before failing the round. Free
+    selection alone permits exactly that (a fast replica taking all ten
+    batches), so each group deals its first ``replicas`` batches round-robin,
+    one to each replica, and only then lets the rest go to whoever is idle.
+    Load-aware for the bulk, guaranteed to close for the barrier.
 
     Computes and returns; writes nothing. The CLI is what persists a curve.
     """
     if batches_per_reduce < replicas:
         # Each group deals its first `replicas` batches one per replica; a group
-        # smaller than that leaves some replica with no work, and it will then
-        # never reach the barrier its peers are blocking on. The trailing-group
-        # path already refuses this case; the main path must too.
+        # smaller than that leaves some replica with no work, so it declines the
+        # round and its peers wait out the averaging timeout on a group that can
+        # never form. The trailing-group path already refuses this case; the
+        # main path must too.
         raise ValueError(
             f"batches_per_reduce ({batches_per_reduce}) must be at least replicas "
             f"({replicas}), or some replica gets no batch in a group and cannot "
@@ -288,32 +291,31 @@ async def train_pipeline(
                 )
 
         async def signal_group_complete(round_id: int) -> None:
-            """Tell every worker its stage has finished a group. Push mode only.
+            """Tell every worker its stage has finished a group.
 
-            This is the whole point of push mode: the trainer dealt the batches,
-            so it knows the group is complete and exactly how large it was, and
-            it says so. No worker has to infer the moment from a gossiped count,
-            and - crucially - no worker has to be holding an incoming backward in
-            order to find out. Every replica is told at the same instant, so they
-            arrive at the all-reduce barrier together instead of whenever their
-            next batch happens to land.
+            The trainer dealt the batches, so it knows the group is complete and
+            exactly how large it was, and it says so. No worker has to infer the
+            moment, and - crucially - no worker has to be holding an incoming
+            backward in order to find out. Every replica is told at the same
+            instant, so they arrive at the all-reduce barrier together instead
+            of whenever their next batch happens to land.
 
             The calls are issued together rather than in sequence: a round cannot
             close until every replica of a stage has joined, so signalling them
             one at a time would serialise exactly what needs to overlap.
             """
-            pending = [
-                asyncio.wrap_future(
-                    signal_reduce(dht, expert.peer_id, expert.uid, round_id, signal_timeout)
-                )
-                for pool in pools
-                for expert in pool.experts
-            ]
-            acks = await asyncio.gather(*pending, return_exceptions=True)
+            experts = [expert for pool in pools for expert in pool.experts]
+            acks = await asyncio.gather(
+                *(
+                    asyncio.wrap_future(
+                        signal_reduce(dht, e.peer_id, e.uid, round_id, signal_timeout)
+                    )
+                    for e in experts
+                ),
+                return_exceptions=True,
+            )
 
-            for expert, ack in zip(
-                [e for pool in pools for e in pool.experts], acks
-            ):
+            for expert, ack in zip(experts, acks):
                 if isinstance(ack, BaseException):
                     # A dropped signal costs this worker one group of gradients:
                     # it keeps accumulating and folds them into the next round,
@@ -325,6 +327,22 @@ async def train_pipeline(
                         expert.uid,
                         type(ack).__name__,
                         ack,
+                    )
+                    continue
+
+                # A worker can accept the signal and still decline the round -
+                # it had no samples, or it noticed it had missed one. That is
+                # not an exception, and it used to be invisible: the ack was
+                # built, serialised, sent, and dropped on the floor right here.
+                # A stage that keeps declining is a stage whose replicas are
+                # drifting apart, so it is worth a line.
+                report = json.loads(ack.metadata) if ack.metadata else {}
+                if not report.get("reduced"):
+                    logger.warning(
+                        "round %d: %s did not reduce (%s)",
+                        round_id,
+                        expert.uid,
+                        report.get("reason", "no reason given"),
                     )
 
         ordinal = 0
@@ -363,7 +381,14 @@ async def train_pipeline(
             samples_seen += batch_samples
             curve.record(samples_seen, batch_loss, batch_accuracy)
 
-        logger.info("batches handled per replica: %s", {p.stage: p.handled for p in pools})
+        logger.info(
+            "batches handled per replica: %s",
+            {p.stage: p.handled for p in pools},
+        )
+        logger.info(
+            "time spent waiting for a free worker: %s",
+            {p.stage: f"{p.polls_blocked * POLL_INTERVAL:.1f}s" for p in pools},
+        )
         return curve
     finally:
         if owns_dht:
@@ -401,21 +426,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--replicas",
         type=int,
         default=2,
-        help="workers hosting each stage; lane r drives <stage>.r for every stage (default: 2)",
+        help="workers hosting each stage; every <stage>.r for r in range(N) "
+        "must already be serving (default: 2)",
     )
-    parser.add_argument(
-        "--expert",
-        default=None,
-        help="drive this single expert uid instead of a pipeline (e.g. full.0)",
-    )
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument(
         "--batches-per-reduce",
         type=int,
         default=10,
-        help="batches per all-reduce group; must match the workers' "
-        "--target-batch-size / --batch-size (default: 10)",
+        help="batches per all-reduce group. The trainer owns this interval "
+        "outright - the workers accumulate until told, so nothing needs to be "
+        "kept in sync with them (default: 10)",
     )
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--max-steps", type=int, default=None)
@@ -425,14 +447,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="where to write the loss curve "
-        "(default: results/distributed_pipeline.json, or distributed_full.json with --expert)",
+        "(default: results/distributed_pipeline.json)",
     )
     parser.add_argument("--log-level", default=None)
     args = parser.parse_args(argv)
     if args.output is None:
-        args.output = RESULTS_DIR / (
-            "distributed_full.json" if args.expert else "distributed_pipeline.json"
-        )
+        args.output = RESULTS_DIR / "distributed_pipeline.json"
     return args
 
 
