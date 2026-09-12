@@ -54,11 +54,16 @@ def rolling_mean(values: list[float], window: int) -> np.ndarray:
     if window <= 1 or size == 0:
         return array
 
+    # `window % 2` rather than a flat +1: an even window cannot be centred
+    # symmetrically on a point, so only an odd one gets the extra slot past the
+    # centre. A flat +1 would average window + 1 points whenever the window is
+    # even, quietly contradicting the figure in the legend.
     half = window // 2
+
     prefix = np.concatenate([[0.0], np.cumsum(array)])
     index = np.arange(size)
     lo = np.maximum(0, index - half)
-    hi = np.minimum(size, index + half + 1)
+    hi = np.minimum(size, index + half + (window % 2))
     return (prefix[hi] - prefix[lo]) / (hi - lo)
 
 
