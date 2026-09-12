@@ -44,6 +44,7 @@ from swarm_mlp.observability import configure_logging, silence_teardown_noise
 from swarm_mlp.reference import BATCH_SIZE, SEED, EPOCHS
 
 RESULTS_DIR = Path(__file__).resolve().parents[2] / "results"
+POLL_INTERVAL_FOR_FREE_WORKER = 0.002
 
 
 def resolve_expert(
@@ -51,14 +52,9 @@ def resolve_expert(
 ):
     """Look up ``expert_uid`` in the DHT, waiting for it to be declared.
 
-    A worker publishes itself on a timer, so a trainer started in the same second
-    will legitimately see ``None`` for a moment. Polling beats requiring the
-    operator to time the two commands.
-
     Note the ``[0] is not None`` test: ``get_experts`` returns a list with one
     entry per requested uid and puts ``None`` in the slots it could not resolve,
-    so the list itself is always truthy and ``if experts:`` would return a
-    ``None`` expert that fails much later, somewhere less informative.
+    so the list itself is always truthy
     """
     deadline = time.monotonic() + timeout
     while True:
@@ -73,17 +69,11 @@ def resolve_expert(
         time.sleep(poll)
 
 
-#: How long an idle coroutine waits before re-checking a stage's free list.
-#: Zero would spin the event loop hot and starve the threads doing the RPCs.
-POLL_INTERVAL = 0.002
-
-
 class StagePool:
     """The free workers hosting one pipeline stage, and who is busy right now.
 
     A batch asks the pool for any idle replica; if all of them are busy it waits,
-    which is the queue for this stage. ``pin`` asks for one specific replica
-    instead - see ``train_pipeline`` for why every group needs a few of those.
+    which is the queue for this stage. 
 
     No lock guards ``_free``. asyncio only switches coroutines at ``await``
     points, and there is no await between testing the list and mutating it, so
@@ -98,25 +88,20 @@ class StagePool:
         self._free = list(range(len(self.experts)))
         #: batches handled per replica; the load-balance evidence
         self.handled = [0] * len(self.experts)
-        #: poll iterations spent with every replica busy. Times POLL_INTERVAL
-        #: this is roughly how long batches sat waiting for a free worker, which
-        #: is the number that says whether this stage is the bottleneck.
+        #: poll iterations spent with every replica busy. Times POLL_INTERVAL_FOR_FREE_WORKER
+        #: this is roughly how long batches sat waiting for a free worker..
         self.polls_blocked = 0
 
-    async def _claim(self, pin: int | None) -> int:
+    async def _claim(self) -> int:
         while True:
-            if pin is None:
-                if self._free:
-                    return self._free.pop(0)
-            elif pin in self._free:
-                self._free.remove(pin)
-                return pin
+            if self._free:
+                return self._free.pop(0)
             self.polls_blocked += 1
-            await asyncio.sleep(POLL_INTERVAL)
+            await asyncio.sleep(POLL_INTERVAL_FOR_FREE_WORKER)
 
     @asynccontextmanager
-    async def use(self, pin: int | None = None):
-        index = await self._claim(pin)
+    async def use(self):
+        index = await self._claim()
         self.handled[index] += 1
         try:
             yield self.experts[index]
@@ -243,7 +228,7 @@ async def train_pipeline(
         # ordinal -> (samples, loss, accuracy); filled concurrently, read in order
         results: dict[int, tuple[int, float, float]] = {}
 
-        async def process_batch(ordinal: int, images, labels, pin: int | None) -> None:
+        async def process_batch(ordinal: int, images, labels) -> None:
             nonlocal completed, window_started
 
             # hivemind validates nested *structure* only, never shapes, so a wrong
@@ -261,7 +246,7 @@ async def train_pipeline(
             # worker - which is exactly the stall the concurrency exists to prevent.
             activations = images
             for pool in pools:
-                async with pool.use(pin=pin) as expert:
+                async with pool.use() as expert:
                     activations = await asyncio.to_thread(expert, activations)
 
             loss = criterion(activations, labels)
@@ -387,7 +372,7 @@ async def train_pipeline(
         )
         logger.info(
             "time spent waiting for a free worker: %s",
-            {p.stage: f"{p.polls_blocked * POLL_INTERVAL:.1f}s" for p in pools},
+            {p.stage: f"{p.polls_blocked * POLL_INTERVAL_FOR_FREE_WORKER:.1f}s" for p in pools},
         )
         return curve
     finally:
@@ -404,7 +389,7 @@ async def _run_group(group, process_batch, replicas: int) -> None:
     """
     await asyncio.gather(
         *(
-            process_batch(ordinal, images, labels, pin=i if i < replicas else None)
+            process_batch(ordinal, images, labels)
             for i, (ordinal, images, labels) in enumerate(group)
         )
     )

@@ -111,27 +111,6 @@ def test_pool_blocks_until_a_replica_is_free():
     assert order.index("start z") > min(order.index("done x"), order.index("done y"))
 
 
-def test_pool_pin_waits_for_that_specific_replica():
-    """Pinning is what guarantees no replica is starved out of an all-reduce."""
-
-    async def scenario():
-        pool = StagePool("stage0", ["a", "b"])
-        async with pool.use(pin=0):
-            # replica 0 is busy; a pinned request for it must wait even though
-            # replica 1 is sitting free
-            pinned = asyncio.ensure_future(_claim_and_report(pool, 0))
-            await asyncio.sleep(0.05)
-            assert not pinned.done(), "pin=0 was served while replica 0 was busy"
-        return await pinned
-
-    assert asyncio.run(scenario()) == "a"
-
-
-async def _claim_and_report(pool, pin):
-    async with pool.use(pin=pin) as expert:
-        return expert
-
-
 # -------------------------------------------------------------- the swarm
 
 
