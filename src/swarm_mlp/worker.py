@@ -8,19 +8,22 @@ That last split is the whole point of this module. hivemind's ``ModuleBackend``
 applies its optimiser after *every* backward call, which would make each remote
 micro-batch its own optimiser step. The assignment needs the opposite:
 accumulate locally, and step only once the workers of this stage have
-*collectively* seen ``target_batch_size`` samples - at which point they
-all-reduce their gradients with each other and step together.
+*collectively* seen a target number of samples - at which point they all-reduce
+their gradients with each other and step together.
 
 ``StageBackend`` below is that inversion, and it has two modes:
 
 * **local** (``grad_averager is None``) - accumulate into private buffers and
   step on the local sample count. This is a single worker hosting a stage on its
   own, and it is what reproduces the single-process reference exactly.
-* **averaged** - accumulate into a ``hivemind.optim.GradientAverager``, publish
-  the local sample count through a ``hivemind.optim.ProgressTracker``, and when
-  the *group's* count crosses the target, all-reduce and step. Replicas of a
-  stage begin from identical weights and apply identical averaged gradients, so
-  they stay identical without ever exchanging parameters.
+* **averaged** - accumulate into the same private buffers and hold them until
+  the trainer signals the round over the control channel. The trainer dealt the
+  batches, so it is the only party that knows the group's exact total; this
+  worker never estimates it and never decides for itself. On the signal it
+  all-reduces with the other replicas of its stage through a
+  ``hivemind.optim.GradientAverager`` and steps. Replicas begin from identical
+  weights and apply identical averaged gradients, so they stay identical
+  without ever exchanging parameters.
 
 The all-reduce runs on hivemind's Runtime thread, inside ``on_backward``, and it
 blocks. That is deliberate and it is also the sharpest constraint on the system:
@@ -45,9 +48,7 @@ import hivemind
 from hivemind.moe.expert_uid import is_valid_uid
 from hivemind.moe.server import ModuleBackend, Server
 from hivemind.optim.grad_averager import GradientAverager
-from hivemind.optim.progress_tracker import ProgressTracker
 from hivemind.utils import BatchTensorDescriptor
-from hivemind.utils.crypto import RSAPrivateKey
 from hivemind.utils.logging import get_logger
 
 from swarm_mlp.control import ControlServer
@@ -66,10 +67,13 @@ class StageBackend(ModuleBackend):
     """A pipeline stage that accumulates gradients and steps at a target batch size.
 
     hivemind's ``ModuleBackend.on_backward`` steps the optimiser after every
-    backward call. This subclass accumulates instead, and steps only once
-    ``target_batch_size`` samples have been seen since the last step - locally if
-    it is alone, or across every replica of its stage if it was given a
-    ``GradientAverager`` and a ``ProgressTracker``.
+    backward call. This subclass accumulates instead. Alone, it steps once it
+    has seen ``target_batch_size`` samples itself. Given a ``GradientAverager``
+    it never decides at all: it steps when the trainer calls ``reduce_now``.
+
+    ``target_batch_size`` is therefore read in local mode *only*. In averaged
+    mode the threshold lives in the trainer, which is the only party that can
+    see what the whole group has processed.
 
     The optimiser is held here rather than passed to ``ModuleBackend.__init__``
     so that no base-class code path can reach it: the base class treats an
@@ -87,7 +91,6 @@ class StageBackend(ModuleBackend):
         args_schema: tuple[BatchTensorDescriptor, ...],
         outputs_schema: BatchTensorDescriptor,
         grad_averager: GradientAverager | None = None,
-        progress_tracker: ProgressTracker | None = None,
         averaging_timeout: float = 120.0,
         **pool_kwargs,
     ) -> None:
@@ -101,19 +104,10 @@ class StageBackend(ModuleBackend):
         )
         self.optimizer = optimizer
         self.target_batch_size = target_batch_size
-
-        # The averager performs the all-reduce, so it is what enables averaged
-        # mode at all. The tracker is optional and only used by the "tracker"
-        # trigger, where it is what makes the threshold collective rather than
-        # per-worker; in push mode the trainer supplies that knowledge instead.
-        # A tracker without an averager is always a mistake.
-        if progress_tracker is not None and grad_averager is None:
-            raise ValueError("progress_tracker was given without a grad_averager")
         self.grad_averager = grad_averager
-        self.tracker = progress_tracker
         self.averaging_timeout = averaging_timeout
         self.local_epoch = 0
-        # Set before the averager and tracker are torn down. The Server thread
+        # Set before the averager is torn down. The Server thread
         # can still deliver a backward after that point, and touching a dead
         # averager blocks forever on an MPFuture whose owner process is gone.
         self._stopping = threading.Event()
@@ -166,10 +160,7 @@ class StageBackend(ModuleBackend):
         channel can call ``reduce_now`` on another, so ``_step_lock`` guards the
         accumulators and counters below.
 
-        Whether crossing the target triggers a reduce depends on the trigger
-        mode. With a ``ProgressTracker`` the worker decides for itself, from a
-        gossiped estimate of the group total. In ``push`` mode it never decides:
-        it accumulates until the trainer - which dealt the batches and therefore
+        Worker accumulates gradients until the trainer - which dealt the batches and therefore
         knows the exact total - tells it the group is complete.
 
         **Why the gradients are weighted by ``batch_size``.** The trainer's loss
@@ -196,15 +187,7 @@ class StageBackend(ModuleBackend):
 
         if self.averaging_enabled:
             self._accumulate_locally(batch_size)
-            if self.tracker is None:
-                return  # push mode: the trainer decides when this group is done
-            # Publishing our own count also advances the tracker's view of the
-            # group total immediately; only the *peer's* contribution has to
-            # travel through the DHT, which is what the check below then sees.
-            self.tracker.report_local_progress(self.local_epoch, self.samples_since_step)
-            if not self.tracker.ready_to_update_epoch:
-                return
-            self._all_reduce_and_step()
+            return
         else:
             self._accumulate_locally(batch_size)
             # `>=` with a reset to zero, not `% target == 0` and not a carried-over
@@ -265,12 +248,10 @@ class StageBackend(ModuleBackend):
                 self.last_round = round_id
                 return {"reduced": False, "reason": "no samples accumulated", "round": round_id}
 
-            # Push mode's equivalent of the tracker's epoch check. If a signal
-            # was lost, the group stepped without us: our peers moved on, our
-            # weights did not, and everything accumulated since was computed
+            # If a signal was lost, the group stepped without us: our peers moved on,
+            # our weights did not, and everything accumulated since was computed
             # against weights the group has left behind. Averaging that in would
-            # corrupt the round, exactly as the stale-epoch branch guards
-            # against in tracker mode.
+            # corrupt the round.
             if 0 <= self.last_round < round_id - 1:
                 self.missed_rounds += 1
                 self._logger.error(
@@ -300,57 +281,23 @@ class StageBackend(ModuleBackend):
 
     def _all_reduce_and_step(self) -> None:
         """All-reduce with this stage's other replicas, then step. Blocks."""
-        if self.tracker is not None and self.tracker.global_epoch > self.local_epoch:
-            # The group averaged and stepped without us. Joining the next round
-            # with gradients computed against stale weights would corrupt it, so
-            # drop them and resynchronise. Should not happen while every replica
-            # is being fed evenly; log loudly if it does.
-            self._logger.warning(
-                "group is at epoch %d, we are at %d - discarding %d locally accumulated "
-                "samples and resynchronising",
-                self.tracker.global_epoch,
-                self.local_epoch,
-                # `samples_since_step`, NOT grad_averager.local_samples_accumulated.
-                # The averager only ever accumulates once, immediately before
-                # step(), which resets it - so its counter is structurally 0 here
-                # and this warning used to report "discarding 0" every time while
-                # the real gradients survived.
-                self.samples_since_step,
-            )
-            # Reset OUR accumulators; the averager's are already empty. This is
-            # the whole point of the branch: gradients computed against weights
-            # the group has since stepped past must not survive into the next
-            # round. Leaving them in place made the next round compute
-            # (stale + fresh) / fresh_samples - measured at 2.11x the correct
-            # gradient, and weighted in the all-reduce as if only the fresh half
-            # existed.
-            self.grad_averager.reset_accumulated_grads_()
-            self._reset_accumulators()
-            with self.tracker.pause_updates():
-                self.local_epoch = self.tracker.update_epoch(self.tracker.global_epoch)
-            self.samples_since_step = 0
-            return
 
         local_samples = self.samples_since_step
-        # A placeholder only: the real collective total is recovered from the
-        # averaging round's `gather` below, which is exact. The tracker's
-        # estimate is used if there is one and the gather somehow fails.
-        group_samples = (
-            self.tracker.global_progress.samples_accumulated
-            if self.tracker is not None
-            else local_samples
-        )
-        peers = self.tracker.global_progress.num_peers if self.tracker is not None else 2
+        # A fallback only: the real collective total is recovered from the
+        # averaging round's `gather` below, which is exact. This value survives
+        # only if that gather comes back in a shape we cannot sum.
+        group_samples = local_samples
 
-        # Deliberately no "skip averaging if num_peers < 2" shortcut here.
-        # tracker.num_peers is a DHT-gossiped estimate and reads 1 for the first
-        # moments of a run before the peer is discovered; stepping locally on
-        # that basis diverges the replicas permanently and nothing ever pulls
-        # them back together (measured: 6.3e-3 drift where averaging gives
-        # <1e-6). Whether we averaged is decided by the averaging result below,
-        # never by a guess made beforehand. A genuinely solo stage should be run
-        # with --no-averaging; if it is not, the round fails on the timeout and
-        # is reported rather than silently corrupting the weights.
+        # Deliberately no "skip averaging if we look alone" shortcut here.
+        # There is no cheap way to learn the group size before matchmaking has
+        # run, and guessing is worse than waiting: stepping locally because a
+        # peer had not been discovered yet diverges the replicas permanently
+        # and nothing ever pulls them back together (measured: 6.3e-3 drift
+        # where averaging gives <1e-6). Whether we averaged is decided by the
+        # averaging result below, never by a guess made beforehand. A genuinely
+        # solo stage should be run with --no-averaging; if it is not, the round
+        # fails on the timeout and is reported rather than silently corrupting
+        # the weights.
 
         # Finish the mean ourselves, then give the averager a single
         # accumulation of it: with one call the anchor equals the batch size and
@@ -370,9 +317,10 @@ class StageBackend(ModuleBackend):
             # weight= is explicit rather than relying on the averager's own
             # sample counter, which we no longer drive call-by-call.
             # The return value is the gathered data from everyone in the group,
-            # so its length is the REAL group size - unlike the tracker's
-            # num_peers, which is a DHT-gossiped estimate and was quietly
-            # reporting 2 on rounds that had actually averaged with nobody.
+            # so its length is the REAL group size. Nothing cheaper is: a
+            # DHT-gossiped peer count was quietly reporting 2 on rounds that
+            # had in fact averaged with nobody, which is why the group size is
+            # taken from the round itself and from nowhere else.
             # `gather` rides along with matchmaking and comes back as a dict of
             # peer -> that peer's payload, so sending our own sample count is
             # what lets every replica report the TRUE collective batch size
@@ -403,10 +351,17 @@ class StageBackend(ModuleBackend):
                 type(error).__name__,
                 error,
                 local_samples,
+                # last_group_size stays 0 until a round actually closes with
+                # peers in it, so this fires exactly when we have never once
+                # met a replica - which is what a misconfigured solo worker
+                # looks like, and is the difference between "the swarm is
+                # flaky" and "you forgot a flag". It reads history rather than
+                # guessing at the round that just failed: a worker that has
+                # averaged before is having a bad round, not a bad config.
                 ""
-                if peers >= 2
-                else " - this stage has seen no peers; run it with --no-averaging "
-                "if it is meant to be the only replica",
+                if self.last_group_size >= 2
+                else " - this stage has never averaged with a peer; run it with "
+                "--no-averaging if it is meant to be the only replica",
             )
             self.grad_averager.reset_accumulated_grads_()
             self._reset_accumulators()
@@ -442,12 +397,13 @@ class StageBackend(ModuleBackend):
     # ----------------------------------------------------------------- shared
 
     def _advance_epoch(self) -> None:
-        """Move to the next round. Only the tracker keeps a shared epoch."""
-        if self.tracker is None:
-            self.local_epoch += 1
-            return
-        with self.tracker.pause_updates():
-            self.local_epoch = self.tracker.update_epoch(self.local_epoch + 1)
+        """Move to the next round.
+
+        The epoch is local bookkeeping only. Replicas stay in step because the
+        trainer signals every round to all of them at once, not because they
+        share a counter anywhere.
+        """
+        self.local_epoch += 1
 
     def _reset_accumulators(self) -> None:
         for param, accumulator in zip(self._params, self._accumulators):
@@ -481,7 +437,7 @@ class StageBackend(ModuleBackend):
             )
 
     def shutdown_averaging(self, shutdown_grace: float = 15.0) -> None:
-        """Stop the control channel, averager and tracker, in that order.
+        """Stop the control channel and averager, in that order.
 
         Order matters: the control channel must stop accepting reduce signals
         before the averager it would drive is torn down, and both must go before
@@ -512,8 +468,6 @@ class StageBackend(ModuleBackend):
     def _shutdown_collectives(self) -> None:
         if self.control is not None:
             self.control.shutdown()
-        if self.tracker is not None:
-            self.tracker.shutdown()
         if self.grad_averager is not None:
             self.grad_averager.shutdown()
 
@@ -548,19 +502,20 @@ def serve(
     stats_interval: float | None = None,
     max_batch_size: int = BATCH_SIZE,
     averaging: bool = False,
-    trigger: str = "tracker",
     min_matchmaking_time: float = 2.0,
     request_timeout: float = 1.0,
     target_group_size: int | None = None,
     averaging_timeout: float = 120.0,
-    progress_refresh: float = 0.3,
 ) -> tuple[hivemind.DHT, Server, StageBackend]:
     """Start a worker hosting ``<stage>.<index>`` and return its parts.
 
     With ``averaging=True`` the worker also joins the all-reduce group for its
-    stage: ``target_batch_size`` is then the threshold for the *group*, not for
-    this worker alone, and two replicas sharing a stage will each contribute
-    roughly half of it before they average and step together.
+    stage and stops deciding when to step: the trainer signals each round over
+    the control channel, and two replicas sharing a stage each contribute
+    whatever they were dealt before they average and step together.
+    ``target_batch_size`` is inert in that mode - the trainer's
+    ``--batches-per-reduce`` is the real threshold. It governs the step
+    interval only under ``averaging=False``.
 
     The caller owns the lifetime: call ``server.shutdown()`` to stop, which also
     shuts down the DHT it was given, and ``backend.shutdown_averaging()``.
@@ -595,10 +550,7 @@ def serve(
         dht_kwargs["identity_path"] = identity_path
     dht = hivemind.DHT(**dht_kwargs)
 
-    if trigger not in ("tracker", "push"):
-        raise ValueError(f"unknown trigger {trigger!r}; expected 'tracker' or 'push'")
-
-    grad_averager = tracker = None
+    grad_averager = None
     if averaging:
         # Both keys are namespaced by stage, so stage0's replicas form one
         # all-reduce group and stage1's form another. They never mix.
@@ -640,35 +592,6 @@ def serve(
             start=True,
         )
 
-    if averaging and trigger == "tracker":
-        # The tracker is what makes the threshold collective in this mode: each
-        # worker publishes its own sample count and reads back the group's.
-        # hivemind's defaults refresh every 3-10s, which suits a swarm that steps
-        # every few minutes and is useless here, where the threshold is crossed
-        # about once a second - the peer's contribution would never arrive in
-        # time and each worker would fire on its own count alone.
-        #
-        # In push mode none of this exists: the trainer dealt the batches, so it
-        # knows the group total exactly and says when the round is due.
-        tracker = ProgressTracker(
-            dht=dht,
-            prefix=f"{stage}_progress",
-            target_batch_size=target_batch_size,
-            min_refresh_period=min(0.1, progress_refresh),
-            default_refresh_period=progress_refresh,
-            max_refresh_period=max(1.0, progress_refresh * 3),
-            # A fresh identity per worker, rather than hivemind's default of
-            # RSAPrivateKey.process_wide(). The tracker publishes its progress
-            # under `subkey=<its public key>`, so two workers sharing one
-            # process - which is how the integration test runs them - would
-            # share a key, overwrite each other's entry, and each see a group of
-            # exactly one. Measured: num_peers stuck at 1 and the group total
-            # equal to the local total. With distinct keys the same test reports
-            # num_peers=2 and a group total that is the sum of both.
-            private_key=RSAPrivateKey(),
-            start=True,
-        )
-
     in_shape, out_shape = STAGE_SHAPES[stage]
     backend = StageBackend(
         uid,
@@ -678,7 +601,6 @@ def serve(
         args_schema=(BatchTensorDescriptor(*in_shape),),
         outputs_schema=BatchTensorDescriptor(*out_shape),
         grad_averager=grad_averager,
-        progress_tracker=tracker,
         averaging_timeout=averaging_timeout,
         min_batch_size=1,
         # One trainer batch per call, deliberately. hivemind's TaskPool groups
@@ -706,7 +628,7 @@ def serve(
         start=True,
     )
 
-    if averaging and trigger == "push":
+    if averaging:
         # Registered here, in the worker's MAIN process, so the handler shares
         # memory with the Runtime thread that owns the accumulators. See the
         # module docstring in control.py for why a ConnectionHandler cannot.
@@ -714,12 +636,15 @@ def serve(
         backend.control.start()
 
     logger.info("hosting %s (%d parameters)", uid, sum(p.numel() for p in module.parameters()))
-    logger.info(
-        "%s, target batch %d samples%s",
-        f"all-reduce group {stage!r}" if averaging else "averaging disabled (solo stage)",
-        target_batch_size,
-        f", triggered by {trigger}" if averaging else "",
-    )
+    if averaging:
+        # target_batch_size is deliberately absent here: it is inert in this
+        # mode, and printing it beside "all-reduce group" invites the reader to
+        # believe this worker is counting toward it. The trainer owns that.
+        logger.info("all-reduce group %r, rounds triggered by the trainer", stage)
+    else:
+        logger.info(
+            "averaging disabled (solo stage), stepping every %d samples", target_batch_size
+        )
     logger.info("peer id %s, dht child pid %s", dht.peer_id, dht.pid)
     logger.info("trainers join with: --initial-peers %s", dht.get_visible_maddrs()[0])
 
@@ -740,15 +665,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--target-batch-size",
         type=int,
         default=None,
-        help="samples this stage accumulates COLLECTIVELY before all-reducing "
-        f"(default: --batches-per-reduce x {BATCH_SIZE})",
+        help="samples to accumulate before stepping. Applies to --no-averaging "
+        "only: with averaging on, the trainer signals every round and this is "
+        f"ignored (default: --batches-per-reduce x {BATCH_SIZE})",
     )
     parser.add_argument(
         "--batches-per-reduce",
         type=int,
         default=BATCHES_PER_REDUCE,
-        help=f"trainer batches per all-reduce; sets the target to N x {BATCH_SIZE} samples "
-        f"(default: {BATCHES_PER_REDUCE}). Ignored if --target-batch-size is given.",
+        help=f"batches per step; sets the target to N x {BATCH_SIZE} samples "
+        f"(default: {BATCHES_PER_REDUCE}). Ignored if --target-batch-size is "
+        "given, and ignored entirely unless --no-averaging - set the interval "
+        "on the trainer instead.",
     )
     parser.add_argument(
         "--batch-size",
@@ -761,14 +689,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--num-handlers", type=int, default=2)
     parser.add_argument("--update-period", type=float, default=5.0)
-    parser.add_argument(
-        "--trigger",
-        choices=("tracker", "push"),
-        default="tracker",
-        help="how this worker learns its stage has finished a group: 'tracker' "
-        "infers it from a DHT-gossiped sample count, 'push' waits to be told by "
-        "the trainer over the control channel (default: tracker)",
-    )
     parser.add_argument(
         "--no-averaging",
         action="store_true",
@@ -797,12 +717,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "the trainer synchronises arrival",
     )
     parser.add_argument("--averaging-timeout", type=float, default=120.0)
-    parser.add_argument(
-        "--progress-refresh",
-        type=float,
-        default=0.3,
-        help="seconds between DHT reads of the group's sample count (hivemind default: 3)",
-    )
     parser.add_argument(
         "--stats-interval",
         type=float,
@@ -835,12 +749,10 @@ def main() -> None:
         stats_interval=args.stats_interval,
         max_batch_size=args.batch_size,
         averaging=not args.no_averaging,
-        trigger=args.trigger,
         min_matchmaking_time=args.min_matchmaking_time,
         request_timeout=args.request_timeout,
         target_group_size=args.target_group_size,
         averaging_timeout=args.averaging_timeout,
-        progress_refresh=args.progress_refresh,
     )
 
     stop = threading.Event()

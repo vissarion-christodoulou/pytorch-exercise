@@ -192,7 +192,7 @@ def test_serve_caps_the_pool_at_the_trainer_batch_size_by_default():
 
 
 class _StubAverager:
-    """Just enough GradientAverager to reach the stale-epoch branch."""
+    """Just enough GradientAverager to reach the missed-round branch."""
 
     def __init__(self):
         self.local_samples_accumulated = 0  # structurally 0 on this path
@@ -202,66 +202,16 @@ class _StubAverager:
         self.resets += 1
 
 
-class _StubTracker:
-    def __init__(self, global_epoch):
-        self.global_epoch = global_epoch
-
-    ready_to_update_epoch = True
-
-    def report_local_progress(self, *args, **kwargs):
-        pass
-
-    def pause_updates(self):
-        import contextlib
-
-        return contextlib.nullcontext()
-
-    def update_epoch(self, new_epoch):
-        return new_epoch
-
-
-def test_stale_epoch_resync_discards_the_local_accumulators():
-    """When the group steps without us, our accumulated gradients must be dropped.
-
-    The branch exists because gradients computed against weights the group has
-    since moved past would corrupt the next round. It used to reset only the
-    *averager's* accumulators - which are structurally empty at that point,
-    since this design accumulates into them once and immediately steps - while
-    the real gradients sat untouched in ``StageBackend._accumulators``.
-
-    The consequence was silent and measurable: the next round computed
-    ``(stale + fresh) / fresh_samples``, roughly twice the true mean gradient,
-    and joined the all-reduce weighted as though only the fresh half existed.
-    The only diagnostic was a warning reporting a count that could only be zero.
-    """
-    module, backend = make_backend()
-    backend.grad_averager = _StubAverager()
-    backend.tracker = _StubTracker(global_epoch=1)
-    backend.local_epoch = 0
-
-    inputs, labels = batch(32)
-    backend.backward(inputs, grad_wrt_logits(module, inputs, labels))
-
-    # The branch fired...
-    assert backend.local_epoch == 1
-    assert backend.samples_since_step == 0
-    # ...and it dropped the gradients it said it was dropping.
-    for accumulator in backend._accumulators:
-        assert torch.count_nonzero(accumulator) == 0, "stale gradients survived the resync"
-    assert backend.steps == 0, "resync must not step"
-
-
 def test_push_mode_discards_gradients_when_a_round_was_missed():
     """A lost reduce signal means the group stepped without us: drop the batch.
 
-    Push mode has no shared epoch to compare against, so the round id the
-    trainer sends is the only way to notice. Without this check a worker that
-    missed a signal would average gradients computed at weights its peers have
-    already left behind.
+    Nothing here shares an epoch counter, so the round id the trainer sends is
+    the only way to notice. Without this check a worker that missed a signal
+    would average gradients computed at weights its peers have already left
+    behind - and would join the round weighted as though they were fresh.
     """
     module, backend = make_backend()
     backend.grad_averager = _StubAverager()
-    backend.tracker = None  # push mode
     backend.last_round = 0
 
     inputs, labels = batch(32)

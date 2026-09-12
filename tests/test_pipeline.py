@@ -214,20 +214,20 @@ def test_2x2_pipeline_all_reduces_and_trains():
 
 
 @pytest.mark.integration
-def test_push_trigger_synchronises_arrival_and_allows_target_group_size():
+def test_trainer_signalled_rounds_allow_target_group_size():
     """The trainer says when to reduce, which is what makes tight matchmaking safe.
 
     ``target_group_size`` lets an all-reduce round close the instant every
     replica has joined instead of waiting out its declared expiration - measured
     at 8.6x faster end to end. It is only safe if the replicas actually arrive
-    together: under the ProgressTracker trigger, this exact configuration
-    (batches_per_reduce=4, target_group_size=2) fails with
-    ``AllreduceException: could not find a group``, because each worker decides
-    for itself from a gossiped count and they drift apart.
+    together, and this exact configuration is the proof: when each worker
+    decided for itself from a DHT-gossiped sample count, batches_per_reduce=4
+    with target_group_size=2 failed outright with ``AllreduceException: could
+    not find a group``, because the workers drifted apart on a lagging estimate.
 
-    Pushing the signal removes the skew by construction - every replica is told
-    at the same instant - so the same settings become safe. That is the property
-    under test here, not merely that push mode runs.
+    Having the trainer signal the round removes that skew by construction -
+    every replica is told at the same instant - so the same settings become
+    safe. That is the property under test here, not merely that the system runs.
     """
     batches_per_reduce, batch_size, replicas = 4, 64, 2
     seed_dht = hivemind.DHT(host_maddrs=LOCAL_MADDRS, start=True)
@@ -243,7 +243,6 @@ def test_push_trigger_synchronises_arrival_and_allows_target_group_size():
                     num_handlers=1,
                     target_batch_size=batches_per_reduce * batch_size,
                     averaging=True,
-                    trigger="push",
                     target_group_size=replicas,
                     min_matchmaking_time=2.0,
                     request_timeout=1.0,
@@ -260,7 +259,6 @@ def test_push_trigger_synchronises_arrival_and_allows_target_group_size():
                 epochs=1,
                 batch_size=batch_size,
                 batches_per_reduce=batches_per_reduce,
-                trigger="push",
                 max_steps=groups * batches_per_reduce,
                 log_every=0,
             )
@@ -271,8 +269,9 @@ def test_push_trigger_synchronises_arrival_and_allows_target_group_size():
         for stage in PIPELINE:
             for index in range(replicas):
                 backend = backends[f"{stage}.{index}"]
-                # Exactly one round per group: the trainer counted the batches,
-                # so there is no overshoot and no round triggered by a heuristic.
+                # Exactly one round per group: the trainer counted the batches
+                # it dealt, so there is no overshoot and no round fired by a
+                # worker guessing at what the group had collectively seen.
                 assert backend.averaging_rounds == groups, (
                     f"{stage}.{index} did {backend.averaging_rounds} rounds, expected {groups}"
                 )
@@ -287,8 +286,14 @@ def test_push_trigger_synchronises_arrival_and_allows_target_group_size():
             )
             assert drift < 1e-4, f"{stage} replicas diverged by {drift:.3e}"
 
-        # No worker should be running a ProgressTracker in this mode at all.
-        assert all(b.tracker is None for b in backends.values())
+        # Every round this swarm ran was one the trainer asked for: each
+        # worker stepped once per signal, none stepped on its own initiative,
+        # none averaged alone, and none missed a signal. This is the assertion
+        # that would catch a worker quietly reintroducing a local threshold.
+        for name, backend in backends.items():
+            assert backend.steps == groups, f"{name} took {backend.steps} steps"
+            assert backend.solo_rounds == 0, f"{name} averaged with nobody"
+            assert backend.missed_rounds == 0, f"{name} missed a reduce signal"
     finally:
         for backend in backends.values():
             backend.shutdown_averaging()

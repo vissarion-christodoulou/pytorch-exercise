@@ -135,7 +135,6 @@ async def train_pipeline(
     epochs: int = EPOCHS,
     batch_size: int = BATCH_SIZE,
     batches_per_reduce: int = 10,
-    trigger: str = "tracker",
     signal_timeout: float = DEFAULT_SIGNAL_TIMEOUT,
     seed: int = SEED,
     max_steps: int | None = None,
@@ -340,8 +339,7 @@ async def train_pipeline(
                 if len(group) < batches_per_reduce:
                     continue
                 await _run_group(group, process_batch, replicas)
-                if trigger == "push":
-                    await signal_group_complete(round_id)
+                await signal_group_complete(round_id)
                 round_id += 1
                 group = []
             if group:
@@ -351,8 +349,7 @@ async def train_pipeline(
                 # batches_per_reduce-1 batches of an epoch.
                 if len(group) >= replicas:
                     await _run_group(group, process_batch, replicas)
-                    if trigger == "push":
-                        await signal_group_complete(round_id)
+                    await signal_group_complete(round_id)
                     round_id += 1
                 else:
                     logger.info(
@@ -414,14 +411,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument(
-        "--trigger",
-        choices=("tracker", "push"),
-        default="tracker",
-        help="how workers learn a group is complete: 'tracker' lets each worker "
-        "infer it from a gossiped count, 'push' has the trainer tell them "
-        "(must match the workers' --trigger)",
-    )
-    parser.add_argument(
         "--batches-per-reduce",
         type=int,
         default=10,
@@ -460,7 +449,6 @@ def main() -> None:
             epochs=args.epochs,
             batch_size=args.batch_size,
             batches_per_reduce=args.batches_per_reduce,
-            trigger=args.trigger,
             seed=args.seed,
             max_steps=args.max_steps,
             log_every=args.log_every,

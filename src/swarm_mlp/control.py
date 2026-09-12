@@ -2,9 +2,10 @@
 
 hivemind's MoE surface gives a client exactly three RPCs - ``rpc_info``,
 ``rpc_forward`` and ``rpc_backward`` - and none of them says "the group is
-complete, reduce now". That gap is why the worker was left to *infer* the moment
-from a ``ProgressTracker``: a DHT-gossiped sum that lags, overshoots the target,
-and only gets consulted when a backward happens to arrive.
+complete, reduce now". Without that, a worker can only *infer* the moment. The
+design this replaced inferred it from a ``ProgressTracker``: a DHT-gossiped sum
+that lags, overshoots the target, and only gets consulted when a backward
+happens to arrive.
 
 The trainer does not have to infer anything. It dealt the batches, so it knows
 exactly when a group is done. This module is the wire that lets it say so.
