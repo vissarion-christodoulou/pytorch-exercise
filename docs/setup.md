@@ -87,7 +87,7 @@ Three files that all look like "dependencies" but answer different questions:
 | `requirements.lock.txt` | *Which exact versions are known to work?* Pins for the whole transitive tree, generated from a verified venv. |
 | `scripts/setup.sh` | *How do I construct the environment?* The ordering and flags needed to get from a bare Ubuntu to a working install. |
 
-`setup.sh` builds the environment; `pyproject.toml` is what makes `src/pytorch_exercise/` importable at all, since a `src/` layout is not on `sys.path` by default. The last step of `setup.sh` installs this project **editable** (`pip install -e`), so source edits take effect immediately and any process can import the package regardless of its working directory — which matters because workers and trainers run as separate processes, with hivemind forking more beneath them.
+`setup.sh` builds the environment; `pyproject.toml` is what makes `src/swarm_mlp/` importable at all, since a `src/` layout is not on `sys.path` by default. The last step of `setup.sh` installs this project **editable** (`pip install -e`), so source edits take effect immediately and any process can import the package regardless of its working directory — which matters because workers and trainers run as separate processes, with hivemind forking more beneath them.
 
 Both the hivemind and project installs pass `--no-deps`, because `requirements.lock.txt` is the single source of truth for versions. The dependency list in `pyproject.toml` is therefore declarative: it documents what the package needs, but does not drive what gets installed.
 

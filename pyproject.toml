@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "pytorch-exercise"
+name = "swarm-mlp"
 version = "0.1.0"
 description = "Peer-to-peer pipeline- and data-parallel training of an MLP on MNIST using hivemind."
 readme = "README.md"
@@ -27,7 +27,7 @@ dependencies = [
 dev = ["pytest"]
 
 [project.scripts]
-pytorch-exercise = "pytorch_exercise.__main__:main"
+swarm-mlp = "swarm_mlp.__main__:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pytorch_exercise"]
+packages = ["src/swarm_mlp"]

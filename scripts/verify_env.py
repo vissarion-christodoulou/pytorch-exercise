@@ -83,9 +83,9 @@ def check_imports() -> None:
     # Imported by name rather than by path: this is what proves the project is
     # installed into the venv, so worker and trainer processes can import it no
     # matter which directory they are launched from.
-    import pytorch_exercise
+    import swarm_mlp
 
-    print(f"    project package importable from {os.path.dirname(pytorch_exercise.__file__)}")
+    print(f"    project package importable from {os.path.dirname(swarm_mlp.__file__)}")
 
 
 def check_dht() -> None:

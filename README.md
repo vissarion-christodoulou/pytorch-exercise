@@ -41,7 +41,7 @@ returns gradients to the caller.
 scripts/
     setup.sh            # idempotent environment bootstrap
     verify_env.py       # hivemind installation checks
-src/pytorch_exercise/
+src/swarm_mlp/
 docs/
     setup.md
 requirements.lock.txt   # exact pins for the verified environment
