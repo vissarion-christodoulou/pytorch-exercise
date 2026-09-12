@@ -35,6 +35,35 @@ Checks that hivemind imports, that two DHT peers can discover each other over
 libp2p, and that a forward/backward round trip through a remotely hosted module
 returns gradients to the caller.
 
+## Reference baseline
+
+Before the distributed system can be judged there has to be something to judge it
+against. The single-process run trains the same `SimpleMLP` on the same MNIST
+pipeline the workers and trainer will use:
+
+```bash
+python -m swarm_mlp
+```
+
+It prints a summary and writes [results/reference_loss.png](results/reference_loss.png).
+Defaults are 3 epochs, batch 64, Adam at 1e-3, seed 0 — all overridable as flags.
+
+Three properties make it usable as a control rather than just a nice graph:
+
+- **Deterministic.** Same seed, same initial weights, same batch order; two runs
+  produce bit-identical curves. The distributed system starts from the same
+  seeded weights and consumes the same data, so the curves should very nearly
+  coincide — a far sharper test than "both trend downwards".
+- **Densely sampled.** Loss is recorded after every optimiser step, not once per
+  epoch. Five points per run cannot separate a subtly wrong all-reduce from
+  noise; a few thousand can.
+- **Plotted against samples consumed**, not step count. Four workers stepping on
+  a shared target-batch-size trigger have no step counter corresponding to this
+  one.
+
+`train_reference()` returns the curve in memory and writes nothing, so the
+eventual comparison script can call it directly.
+
 ## Layout
 
 ```
@@ -42,7 +71,12 @@ scripts/
     setup.sh            # idempotent environment bootstrap
     verify_env.py       # hivemind installation checks
 src/swarm_mlp/
+    model.py            # SimpleMLP, mandated verbatim by the assignment
+    data.py             # MNIST pipeline, shared by reference and trainer
+    reference.py        # single-process baseline -> LossCurve
+    __main__.py         # CLI: run the baseline, plot the curve
 docs/
     setup.md
+results/                # committed plots
 requirements.lock.txt   # exact pins for the verified environment
 ```
