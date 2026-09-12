@@ -176,6 +176,12 @@ CHECKS = [
 
 
 def main() -> int:
+    # hivemind logs to stderr (unbuffered) while our progress goes to stdout,
+    # which Python block-buffers when it is a pipe rather than a terminal - as it
+    # is when invoked via `wsl -d Ubuntu -- ...` from PowerShell. Without this the
+    # two streams interleave mid-line and the report is unreadable.
+    sys.stdout.reconfigure(line_buffering=True)
+
     silence_teardown_noise()
 
     failures = []
