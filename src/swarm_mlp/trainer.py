@@ -76,100 +76,6 @@ def resolve_expert(
         time.sleep(poll)
 
 
-def train(
-    *,
-    expert_uid: str,
-    initial_peers: Sequence[str],
-    epochs: int = EPOCHS,
-    batch_size: int = BATCH_SIZE,
-    seed: int = SEED,
-    max_steps: int | None = None,
-    log_every: int = 100,
-    resolve_timeout: float = 60.0,
-    dht: hivemind.DHT | None = None,
-) -> LossCurve:
-    """Drive a remote stage over MNIST and return the training loss curve.
-
-    Computes and returns; writes nothing. The CLI is what persists a curve.
-    """
-    logger = configure_logging("trainer")
-
-    owns_dht = dht is None
-    if owns_dht:
-        dht = hivemind.DHT(initial_peers=list(initial_peers), start=True)
-
-    try:
-        started = time.monotonic()
-        expert = resolve_expert(dht, expert_uid, timeout=resolve_timeout)
-        logger.info(
-            "resolved %s -> %s after %.1fs", expert_uid, expert.peer_id, time.monotonic() - started
-        )
-
-        stage = expert_uid.rsplit(".", 1)[0]
-        if stage not in STAGE_SHAPES:
-            raise ValueError(f"unknown stage {stage!r} for uid {expert_uid!r}")
-        in_shape, _ = STAGE_SHAPES[stage]
-
-        loader = mnist_train_loader(batch_size=batch_size, seed=seed)
-        criterion = nn.CrossEntropyLoss()
-
-        curve = LossCurve(
-            meta={
-                "source": "distributed",
-                "epochs": epochs,
-                "batch_size": batch_size,
-                "learning_rate": None,  # owned by the worker; see `meta["note"]`
-                "seed": seed,
-                "expert_uid": expert_uid,
-                "note": "learning rate lives on the worker; the trainer holds no optimiser",
-            }
-        )
-
-        samples_seen = 0
-        window_started = time.monotonic()
-
-        for epoch in range(epochs):
-            for step, (images, labels) in enumerate(loader):
-                # hivemind validates nested *structure* only, never shapes, so a
-                # wrong shape would sail through the client and fail obscurely on
-                # the far side of the RPC. Check it here, where the traceback is.
-                if tuple(images.shape[1:]) != in_shape:
-                    raise ValueError(
-                        f"batch shape {tuple(images.shape)} does not match stage input {in_shape}"
-                    )
-
-                logits = expert(images)
-                loss = criterion(logits, labels)
-                loss.backward()  # remote: see the module docstring
-
-                samples_seen += labels.size(0)
-                batch_accuracy = logits.argmax(dim=1).eq(labels).float().mean().item()
-                curve.record(samples_seen, loss.item(), batch_accuracy)
-
-                if log_every and step % log_every == 0:
-                    now = time.monotonic()
-                    rate = log_every / (now - window_started) if step else 0.0
-                    window_started = now
-                    logger.info(
-                        "epoch %d/%d  step %4d  samples %6d  loss %.4f  acc %.3f%s",
-                        epoch + 1,
-                        epochs,
-                        step,
-                        samples_seen,
-                        loss.item(),
-                        batch_accuracy,
-                        f"  ({rate:.1f} steps/s)" if rate else "",
-                    )
-
-                if max_steps is not None and len(curve) >= max_steps:
-                    return curve
-
-        return curve
-    finally:
-        if owns_dht:
-            dht.shutdown()
-
-
 #: How long an idle coroutine waits before re-checking a stage's free list.
 #: Zero would spin the event loop hot and starve the threads doing the RPCs.
 POLL_INTERVAL = 0.002
@@ -546,31 +452,20 @@ def main() -> None:
     logger = configure_logging("trainer", args.log_level)
     silence_teardown_noise()
 
-    if args.expert:
-        curve = train(
-            expert_uid=args.expert,
+    curve = asyncio.run(
+        train_pipeline(
             initial_peers=args.initial_peers,
+            stages=args.stages,
+            replicas=args.replicas,
             epochs=args.epochs,
             batch_size=args.batch_size,
+            batches_per_reduce=args.batches_per_reduce,
+            trigger=args.trigger,
             seed=args.seed,
             max_steps=args.max_steps,
             log_every=args.log_every,
         )
-    else:
-        curve = asyncio.run(
-            train_pipeline(
-                initial_peers=args.initial_peers,
-                stages=args.stages,
-                replicas=args.replicas,
-                epochs=args.epochs,
-                batch_size=args.batch_size,
-                batches_per_reduce=args.batches_per_reduce,
-                trigger=args.trigger,
-                seed=args.seed,
-                max_steps=args.max_steps,
-                log_every=args.log_every,
-            )
-        )
+    )
 
     tail = min(len(curve), 50)
     mean_loss = sum(curve.loss[-tail:]) / tail
