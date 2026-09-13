@@ -192,7 +192,10 @@ class StageBackend(ModuleBackend):
 
             samples = self.samples_since_step
             before = self.steps
-            self._all_reduce_and_step()
+            try:
+                self._all_reduce_and_step()
+            except BaseException as e:
+                return {"reduced": False, "reason": f"missed a round: {str(e)}", "round": round_id}
             self.last_round = round_id
             return {
                 "reduced": self.steps > before,
@@ -222,58 +225,26 @@ class StageBackend(ModuleBackend):
         # Blocks until the other replicas of this stage arrive at the same
         # barrier. step() also loads the accumulators into the averager and
         # resets them.
-        try:
-            # weight= is passed explicitly rather than left to default to the
-            # averager's own local_samples_accumulated.
-            # It is what makes a replica that processed more
-            # samples count proportionally more, and so what keeps the averaged
-            # gradient equal to the gradient of the mean loss over every sample
-            # the group saw, however unevenly they were split.
-            # The return value is the gathered data from everyone in the group,
-            # so its length is the REAL group size.
-            # `gather` makes the function return a dict of {peer, gather_value}
-            gathered = self.grad_averager.step(
-                weight=float(local_samples),
-                gather=local_samples,
-                timeout=self.averaging_timeout,
-            )
-            group_size = len(gathered) if hasattr(gathered, "__len__") else 1
-            if isinstance(gathered, dict) and gathered:
-                try:
-                    group_samples = sum(int(v) for v in gathered.values())
-                except (TypeError, ValueError):
-                    pass  # keep the fallback below
-        except BaseException as error:
-            # This runs under rpc_reduce_now, so an escaping exception is
-            # delivered to the *trainer* as a P2PHandlerError and takes the
-            # whole run down with it. A round that could not find its peers is a
-            # reason to drop one group of gradients, not to stop training. The
-            # replicas may drift apart if this keeps happening - nothing here
-            # re-synchronises weights - so it is logged at ERROR.
-            self._logger.error(
-                "all-reduce round failed (%s: %s); dropping %d locally accumulated "
-                "samples and continuing%s",
-                type(error).__name__,
-                error,
-                local_samples,
-                # last_group_size stays 0 until a round actually closes with
-                # peers in it, so this fires exactly when we have never once
-                # met a replica - which is what a misconfigured solo worker
-                # looks like, and is the difference between "the swarm is
-                # flaky" and "you forgot a flag". It reads history rather than
-                # guessing at the round that just failed: a worker that has
-                # averaged before is having a bad round, not a bad config.
-                ""
-                if self.last_group_size >= 2
-                else " - this stage has never averaged with a peer; check that "
-                "another replica of it is running and was given the same "
-                "--initial-peers",
-            )
-            self.grad_averager.reset_accumulated_grads_()
-            self._reset_accumulators()
-            self.failed_rounds += 1
-            self.samples_since_step = 0
-            return
+        # weight= is passed explicitly rather than left to default to the
+        # averager's own local_samples_accumulated.
+        # It is what makes a replica that processed more
+        # samples count proportionally more, and so what keeps the averaged
+        # gradient equal to the gradient of the mean loss over every sample
+        # the group saw, however unevenly they were split.
+        # The return value is the gathered data from everyone in the group,
+        # so its length is the REAL group size.
+        # `gather` makes the function return a dict of {peer, gather_value}
+        gathered = self.grad_averager.step(
+            weight=float(local_samples),
+            gather=local_samples,
+            timeout=self.averaging_timeout,
+        )
+        group_size = len(gathered) if hasattr(gathered, "__len__") else 1
+        if isinstance(gathered, dict) and gathered:
+            try:
+                group_samples = sum(int(v) for v in gathered.values())
+            except (TypeError, ValueError):
+                pass  # keep the fallback below
 
         with self.grad_averager.use_averaged_gradients():
             sum_of_squares = sum(
@@ -286,14 +257,14 @@ class StageBackend(ModuleBackend):
         self.averaging_rounds += 1
         if group_size < 2:
             # Averaging "succeeded" with nobody else in the group, so this step
-            # applied only our own gradient while our peer applied only theirs -
-            # the replicas have now diverged and nothing here resynchronises them.
+            # applied only our own gradient.
             self.solo_rounds += 1
-            self._logger.warning(
+            self._logger.error(
                 "all-reduce round completed with a group of %d: this step was NOT "
                 "averaged and the replicas of this stage have diverged",
                 group_size,
             )
+            raise BaseException("Worker stepped on local weights only")
         self._finish_step(group_samples, group_size=group_size, local_samples=local_samples)
 
     # ----------------------------------------------------------------- shared
