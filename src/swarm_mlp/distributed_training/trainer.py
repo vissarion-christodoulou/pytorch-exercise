@@ -301,6 +301,7 @@ async def train_pipeline(
                         expert.uid,
                         report.get("reason", "no reason given"),
                     )
+                    raise Exception
 
         ordinal = 0
         round_id = 0

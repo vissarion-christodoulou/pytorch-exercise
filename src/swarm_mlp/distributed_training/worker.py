@@ -177,20 +177,9 @@ class StageBackend(ModuleBackend):
             if self._stopping.is_set():
                 return {"reduced": False, "reason": "worker is shutting down"}
             if self.samples_since_step == 0:
-                # Nothing arrived for this worker in that group, For static 
-                # 2x2 model that's fine, because a step of the other worker 
-                # would find itself alone in the gradient_averager after matchmaking
-                # timeout and would drop its work. Trainer avoids this case that
-                # would waste time
-                self.last_round = round_id
-                return {"reduced": False, "reason": "no samples accumulated", "round": round_id}
-
-            # If a signal was lost, the group stepped without us: our peers moved on,
-            # our weights did not, and everything accumulated since was computed
-            # against weights the group has left behind. Averaging that in would
-            # corrupt the round.
+                self._logger.error("no steps recorded in round %d", self.last_round + 1)
+                return {"reduced": False, "reason": "No steps recorded", "round": round_id}
             if 0 <= self.last_round < round_id - 1:
-                self.missed_rounds += 1
                 self._logger.error(
                     "missed round(s) %d..%d - the group stepped without us. Discarding "
                     "%d stale samples. NOTE: our weights are now behind our peers' and "
@@ -199,9 +188,6 @@ class StageBackend(ModuleBackend):
                     round_id - 1,
                     self.samples_since_step,
                 )
-                self._reset_accumulators()
-                self.samples_since_step = 0
-                self.last_round = round_id
                 return {"reduced": False, "reason": "missed a round", "round": round_id}
 
             samples = self.samples_since_step

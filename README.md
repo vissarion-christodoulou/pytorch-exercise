@@ -12,7 +12,7 @@ The system has two services:
   collectively reach the target batch size they all-reduce gradients and step.
 - **trainer** — holds no weights. It samples data batches and routes
   activations and gradients between workers. It orchestrates load balancing
-  within a stage and triggers all-reduce when the target bach size is reached. For simplicity, harming generalization, assuming same number of workers (replicas) per stage. Again for simplicity, harming speed, the all-reduce is triggered once all stages are done propagating.
+  within a stage and triggers all-reduce when the target bach size is reached.
 
 ## Setup
 
@@ -97,6 +97,18 @@ results/
     comparison_{ts}.txt
 ```
 ts here is the timestamp of the corresponding distributed run curve. The txt file shows that the mean difference in loss is 5.3e-0.5 and the max difference is 4.071e-04, hence accepting the models as equivalent at the 0.001 precision level. In the png, the two curves overlay one another. By using the same seeds, the models have achieved exactly the same behaviour!
+
+## Tradeoffs
+I have opted for simplicity in a number of cases to focus on producing a Proof of Concept rather than having to worry about how the implementation generalizes or handles adverse situations:
+
+
+<ol>
+  <li>Assuming static 2x2 model throughout (harming generalization)
+</li>
+  <li>The all-reduce is triggered once all stages are done propagating (harming speed)</li>
+  <li>A worker crashing or losing synchronization with peers causes the trainer to do and lives other workers "orphaned"</li>
+</ol>
+
 
 ## Layout
 
