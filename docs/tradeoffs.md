@@ -12,4 +12,5 @@ I have opted for simplicity in a number of cases to focus on producing a Proof o
   <li>RPC failures/hanging are not detected. This means some of the experiments described might have sporadic failures.</li>
   <li>The experimenting on ablation is not reproducible through a single python command. Data collection was done largely by hand/with the help of ai tools, but should be a fairly straightforward implementation.</li>
   <li>All the results are saved under results/, which is not gitignored. Files are produced when training by both trainers and workers so take care when commiting after running.</li>
+  <li>Testing for a slower worker has not been shown. The trainer is load-aware, so simply having a worker sleep on forward propagation should do the trick - would be interesting to collect relevant statistics.</li>
 </ol>
