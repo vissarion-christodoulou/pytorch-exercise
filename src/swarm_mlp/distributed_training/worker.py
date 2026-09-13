@@ -91,10 +91,17 @@ class StageBackend(ModuleBackend):
         # can still deliver a backward after that point, and touching a dead
         # averager blocks forever on an MPFuture whose owner process is gone.
         self._stopping = threading.Event()
-        # on_backward now runs on the Runtime thread while reduce_now runs on
-        # the control channel's thread, so the accumulators finally do need a
-        # lock. It is nearly uncontended in practice: the trainer only signals a
-        # reduce once every backward of the group has returned.
+        # shutdown_averaging acquires it to
+        # wait out an all-reduce already in flight before killing the averager
+        # that round is using. Without that the worker hung for the full
+        # averaging_timeout and went deaf to Ctrl+C.
+        #
+        # Holding it across the accumulation keeps the invariant local, too.
+        # "No backward overlaps a reduce" is a property of the *trainer*,
+        # enforced by nothing on this side of the wire: a retry added to
+        # signal_group_complete, or a second trainer pointed at this worker,
+        # would break it silently and corrupt the accumulators. An uncontended
+        # RLock per batch is not a price worth haggling over to find that out.
         self._step_lock = threading.RLock()
         #: set by serve(); owns the thread serving rpc_reduce_now
         self.control: object | None = None
@@ -132,9 +139,7 @@ class StageBackend(ModuleBackend):
         """Accumulate this call's gradients. Never steps.
 
         Called by hivemind's ``Runtime`` loop, which runs in the Server thread of
-        the main process. It is the only caller on that thread, but the control
-        channel can call ``reduce_now`` on another, so ``_step_lock`` guards the
-        accumulators and counters below.
+        the main process, and the only caller on that thread. 
 
         The gradients stay here until the trainer - which dealt the batches and
         therefore knows the exact total - says the group is complete.
@@ -418,8 +423,8 @@ def serve(
     update_period: float = 5.0,
     stats_interval: float | None = None,
     max_batch_size: int = BATCH_SIZE,
-    min_matchmaking_time: float = 2.0,
-    request_timeout: float = 1.0,
+    min_matchmaking_time: float = 0.05,
+    request_timeout: float = 0.04,
     target_group_size: int | None = None,
     averaging_timeout: float = 120.0,
 ) -> tuple[hivemind.DHT, Server, StageBackend]:
@@ -581,14 +586,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--min-matchmaking-time",
         type=float,
-        default=2.0,
+        default=0.05,
         help="seconds each all-reduce round spends looking for peers (hivemind default: 5); "
         "must be larger than --request-timeout",
     )
     parser.add_argument(
         "--request-timeout",
         type=float,
-        default=1.0,
+        default=0.04,
         help="seconds for a single matchmaking request (hivemind default: 3)",
     )
     parser.add_argument(
