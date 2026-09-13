@@ -1,6 +1,6 @@
 """Rendering for loss curves.
 
-Separated from the CLIs so that ``swarm_mlp.utils.compare`` and ``swarm_mlp.__main__``
+Separated from the CLIs so that ``swarm_mlp.utils.compare`` and ``swarm_mlp.baseline_reference.__main__``
 render the same way, and so that importing a training function does not drag
 matplotlib in with it.
 """

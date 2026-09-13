@@ -12,7 +12,7 @@ The system has two services:
   collectively reach the target batch size they all-reduce gradients and step.
 - **trainer** — holds no weights. It samples data batches and routes
   activations and gradients between workers. It orchestrates load balancing
-  within a stage and triggers all-reduce when the target bach size is reached
+  within a stage and triggers all-reduce when the target bach size is reached. For simplicity, harming generalization, assuming same number of workers (replicas) per stage. Again for simplicity, harming speed, the all-reduce is triggered once all stages are done propagating.
 
 ## Setup
 
@@ -43,7 +43,7 @@ against. The single-process run trains the same `SimpleMLP` on the same MNIST
 pipeline the workers and trainer will use:
 
 ```bash
-python -m swarm_mlp
+python -m swarm_mlp.baseline_reference
 ```
 
 It prints a summary and writes [results/reference_loss.png](results/reference_loss.png).
@@ -61,13 +61,42 @@ Three properties make it usable as a control rather than just a nice graph:
 `train_reference()` returns the curve in memory and writes nothing, so the
 eventual comparison script can call it directly.
 
-## TRAINER
-For every stage in the model, it holds a pool of corresponding workers.
-For simplicity, harming generalization, assuming same number of workers (replicas) per stage.
-Again for simplicity, harming speed, the all-reduce is triggered once all stages are done propagating.
+## Train distributed
+To train the distributed model, start up 4 workers, 2 for each stage:
+```bash
+python src/swarm_mlp/distributed_training/worker.py --stage stage0 --index 0
+python src/swarm_mlp/distributed_training/worker.py --stage stage0 --index 1
+python src/swarm_mlp/distributed_training/worker.py --stage stage1 --index 0
+python src/swarm_mlp/distributed_training/worker.py --stage stage1 --index 1
+```
 
+On startup, workers print their peer id and tcp port, allowing us to start up a
+trainer with known peers (example peers given below):
+```bash
+python src/swarm_mlp/distributed_training/trainer.py --initial-peers /ip4/127.0.0.1/tcp/41527/p2p/12D3KooWRbeoKaUfFurHKZJ8CBdeW5Q1GSeuT5nFimYJcwJ3i7mR /ip4/127.0.0.1/tcp/42475/p2p/12D3KooWCjSLeZooFcPRFXBByEZaDKgYG496KJV9Hou3i6ZwTMJE /ip4/127.0.0.1/tcp/37423/p2p/12D3KooWJtHozKtnzA2vT6X3rJdWbyGQE4xH1pciv5hWhSRQAfX4 /ip4/127.0.0.1/tcp/32975/p2p/12D3KooWCCf266PgMvrL99tfhrrJu7ZAiEUSuo39eMBa8B7WhQZG
+```
 
-## WORKER
+Run without arguments to see all optional arguments that can be passed to the trainer and workers.
+
+## Results
+### Reference curve standalone
+reference_loss.png is the loss curve is the cross entropy loss and the accuracy of the reference 
+model - SimpleMLP non-distributed, 64 samples per batch. It can be acquired by running from the venv:
+```bash
+python -m swarm_mlp.baseline_reference
+```
+### Compare distributed to reference
+First, I trained the distributed model with default parameters (notably batch_size of 64, batches per group of 10, 3 epochs on the 60k sample dataset). The trainer, upon completion, saves the results under results/distributed_pipeline_{ts}.json where ts is the timestamp of the run. I then run:
+```bash
+python src/swarm_mlp/utils/compare.py --distributed results/distributed_pipeline_{ts}.json  
+```
+The compare runs the reference model with the exact same parameters, saved as metadata in the json file of the distributed run. It uses a batch size of batch_size * batches_per_group, since that is when a step occurs in the distributed model. The compare has two outputs:
+```
+results/
+    compare_pipeline_{ts}.png
+    comparison_{ts}.txt
+```
+ts here is the timestamp of the corresponding distributed run curve. The txt file shows that the mean difference in loss is 5.3e-0.5 and the max difference is 4.071e-04, hence accepting the models as equivalent at the 0.001 precision level. In the png, the two curves overlay one another. By using the same seeds, the models have achieved exactly the same behaviour!
 
 ## Layout
 
@@ -76,8 +105,8 @@ scripts/
     setup.sh            # idempotent environment bootstrap
     verify_env.py       # hivemind installation checks
 src/swarm_mlp/
-    __main__.py                 # CLI: run the baseline, plot the curve
     baseline_reference/
+        __main__.py             # CLI: run the baseline, plot the curve
         reference.py            # single-process baseline -> LossCurve
     distributed_training/
         trainer.py              # the trainer class

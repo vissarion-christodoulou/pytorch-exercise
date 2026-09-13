@@ -37,7 +37,13 @@ import hivemind
 from hivemind.moe.server import get_experts
 
 from swarm_mlp.distributed_training.control import DEFAULT_SIGNAL_TIMEOUT, signal_reduce
-from swarm_mlp.utils.constants import BATCH_SIZE, EPOCHS, RESULTS_DIR, SEED
+from swarm_mlp.utils.constants import (
+    BATCH_SIZE,
+    CURVE_TIMESTAMP_FORMAT,
+    EPOCHS,
+    RESULTS_DIR,
+    SEED,
+)
 from swarm_mlp.utils.curves import LossCurve
 from swarm_mlp.utils.data import mnist_train_loader
 from swarm_mlp.utils.model import PIPELINE, STAGE_SHAPES
@@ -396,12 +402,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="where to write the loss curve "
-        "(default: results/distributed_pipeline.json)",
+        "(default: results/distributed_pipeline_<timestamp>.json)",
     )
     parser.add_argument("--log-level", default=None)
     args = parser.parse_args(argv)
     if args.output is None:
-        args.output = RESULTS_DIR / "distributed_pipeline.json"
+        # Stamped, so a run never silently overwrites the curve from the last
+        # one - these take minutes to produce and are the only record of a
+        # configuration that has since been changed. compare.py reads this stamp
+        # back off the filename, which is why the format is shared rather than
+        # spelled out here.
+        stamp = time.strftime(CURVE_TIMESTAMP_FORMAT)
+        args.output = RESULTS_DIR / f"distributed_pipeline_{stamp}.json"
     return args
 
 

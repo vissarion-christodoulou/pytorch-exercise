@@ -27,6 +27,12 @@ DATA_ROOT = PROJECT_ROOT / "data"
 #: Curves and plots are written here.
 RESULTS_DIR = PROJECT_ROOT / "results"
 
+#: How the trainer stamps a curve filename, and how compare.py reads that stamp
+#: back out. Shared because a drift here is silent: compare would simply stop
+#: recognising the stamp and overwrite one unstamped report every run. No colons
+#: - results/ lives on a Windows mount - and it sorts lexicographically.
+CURVE_TIMESTAMP_FORMAT = "%Y%m%d-%H%M%S"
+
 EPOCHS = 3
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-3
