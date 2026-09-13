@@ -17,15 +17,13 @@ sample weighting in ``on_backward`` is only correct for that convention.
 from __future__ import annotations
 
 import multiprocessing as mp
-import random
 
-import pytest
 import torch
 import torch.nn as nn
 
 from hivemind.utils import BatchTensorDescriptor
 
-from swarm_mlp.worker import StageBackend
+from swarm_mlp.distributed_training.worker import StageBackend
 
 IN_FEATURES, OUT_FEATURES, BATCH = 4, 3, 64
 
@@ -156,8 +154,8 @@ def test_backward_pool_is_capped_to_one_trainer_batch():
 def test_serve_caps_the_pool_at_the_trainer_batch_size_by_default():
     import inspect
 
-    from swarm_mlp.reference import BATCH_SIZE
-    from swarm_mlp.worker import serve
+    from swarm_mlp.utils.constants import BATCH_SIZE
+    from swarm_mlp.distributed_training.worker import serve
 
     assert inspect.signature(serve).parameters["max_batch_size"].default == BATCH_SIZE
 

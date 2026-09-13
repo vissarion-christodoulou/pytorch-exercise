@@ -13,16 +13,9 @@ from pathlib import Path
 
 import numpy as np
 
-from swarm_mlp.plotting import plot_curve
-from swarm_mlp.reference import (
-    BATCH_SIZE,
-    EPOCHS,
-    LEARNING_RATE,
-    SEED,
-    train_reference,
-)
-
-RESULTS_DIR = Path(__file__).resolve().parents[2] / "results"
+from swarm_mlp.baseline_reference.reference import train_reference
+from swarm_mlp.utils.constants import BATCH_SIZE, EPOCHS, LEARNING_RATE, RESULTS_DIR, SEED
+from swarm_mlp.utils.plotting import plot_curve
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

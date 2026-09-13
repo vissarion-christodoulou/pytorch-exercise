@@ -89,10 +89,6 @@ def build_stage(stage: str, seed: int, device: str = "cpu") -> nn.Module:
     the same stage constructed with the same seed hold bit-identical weights,
     and the union of stage0 and stage1 is exactly the reference's model. That is
     what makes the replicas' gradients averageable and the curves comparable.
-
-    The boundary was chosen at fc1/fc2 because it is the only split where the
-    activation crossing the wire (256 floats per sample) is smaller than the
-    input (784), so the pipeline does not cost more bandwidth than it saves.
     """
     if stage not in STAGE_SHAPES:
         raise ValueError(f"unknown stage {stage!r}; known stages: {sorted(STAGE_SHAPES)}")

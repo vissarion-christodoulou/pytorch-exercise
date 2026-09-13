@@ -1,6 +1,6 @@
 """Rendering for loss curves.
 
-Separated from the CLIs so that ``swarm_mlp.compare`` and ``swarm_mlp.__main__``
+Separated from the CLIs so that ``swarm_mlp.utils.compare`` and ``swarm_mlp.__main__``
 render the same way, and so that importing a training function does not drag
 matplotlib in with it.
 """
@@ -20,7 +20,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402  - must follow matplotlib.use
 import numpy as np  # noqa: E402
 
-from swarm_mlp.curves import LossCurve  # noqa: E402
+from swarm_mlp.utils.curves import LossCurve  # noqa: E402
 
 REFERENCE_COLOR = "#4c72b0"
 DISTRIBUTED_COLOR = "#c44e52"

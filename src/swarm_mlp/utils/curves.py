@@ -3,7 +3,7 @@
 Lives in its own module because it is the one thing the reference run and the
 distributed run have to agree about. Everything else differs between them - one
 is a for-loop, the other is five processes and a DHT - but both emit the same
-three parallel series, and the comparison in ``swarm_mlp.compare`` is only
+three parallel series, and the comparison in ``swarm_mlp.utils.compare`` is only
 meaningful because the shape is shared rather than reimplemented twice.
 
 Persistence is deliberately kept out of the training functions. ``train_reference``

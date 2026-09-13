@@ -14,9 +14,9 @@ import torch.nn as nn
 
 import hivemind
 
-from swarm_mlp.model import PIPELINE, STAGE_SHAPES, build_model, build_stage
-from swarm_mlp.trainer import StagePool, train_pipeline
-from swarm_mlp.worker import serve
+from swarm_mlp.utils.model import PIPELINE, STAGE_SHAPES, build_model, build_stage
+from swarm_mlp.distributed_training.trainer import StagePool, train_pipeline
+from swarm_mlp.distributed_training.worker import serve
 
 LOCAL_MADDRS = ["/ip4/127.0.0.1/tcp/0"]
 
@@ -88,6 +88,47 @@ def test_pool_hands_out_every_replica_before_repeating():
         return pool.handled
 
     assert asyncio.run(scenario()) == [1, 1]
+
+
+def test_every_replica_gets_work_without_pinning():
+    """No replica can be starved out of an all-reduce, whatever the arrival skew.
+
+    A replica handed no batches has nothing to contribute, so it declines the
+    reduce signal - and its peers then wait out the full averaging_timeout on a
+    group that can never reach hivemind's min_group_size of 2. An earlier design
+    pinned the first ``replicas`` batches one per replica to prevent that.
+
+    It turns out the data structure already guarantees it, which is why the
+    pinning could go: ``_free`` starts holding every replica exactly once, and
+    ``_claim`` pops from the front before any release can append a duplicate, so
+    the first ``replicas`` claims necessarily land on distinct replicas. This
+    pins that property, since it is the only thing standing between free-worker
+    selection and a stalled round.
+    """
+
+    async def scenario(n_batches, n_replicas, delays):
+        pool = StagePool("stage0", [f"r{i}" for i in range(n_replicas)])
+
+        async def one(i):
+            async with pool.use():
+                await asyncio.sleep(delays[i])
+
+        await asyncio.gather(*(one(i) for i in range(n_batches)))
+        return pool.handled
+
+    for replicas in (2, 3, 4):
+        for batches in range(replicas, replicas + 6):
+            for name, delays in (
+                ("instant", [0.0] * batches),
+                ("uniform", [0.002] * batches),
+                # one replica held far longer than the rest, which is the skew
+                # that a pinning scheme was meant to protect against
+                ("one slow", [0.02 if i == 0 else 0.0 for i in range(batches)]),
+            ):
+                handled = asyncio.run(scenario(batches, replicas, delays))
+                assert all(h > 0 for h in handled), (
+                    f"{name}: {batches} batches over {replicas} replicas starved one: {handled}"
+                )
 
 
 def test_pool_blocks_until_a_replica_is_free():

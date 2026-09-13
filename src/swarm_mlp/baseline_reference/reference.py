@@ -25,17 +25,10 @@ from __future__ import annotations
 import torch.nn as nn
 import torch.optim as optim
 
-from swarm_mlp.curves import LossCurve
-from swarm_mlp.data import mnist_train_loader
-from swarm_mlp.model import build_model
-
-# Defaults shared by whatever calls this. When the distributed trainer lands it
-# should import these rather than restate them; a silent disagreement about the
-# learning rate would look exactly like a bug in the gradient averaging.
-EPOCHS = 3
-BATCH_SIZE = 64
-LEARNING_RATE = 1e-3
-SEED = 0
+from swarm_mlp.utils.constants import BATCH_SIZE, EPOCHS, LEARNING_RATE, SEED
+from swarm_mlp.utils.curves import LossCurve
+from swarm_mlp.utils.data import mnist_train_loader
+from swarm_mlp.utils.model import build_model
 
 
 def train_reference(

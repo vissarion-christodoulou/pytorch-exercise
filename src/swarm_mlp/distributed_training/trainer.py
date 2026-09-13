@@ -36,15 +36,14 @@ import torch.nn as nn
 import hivemind
 from hivemind.moe.server import get_experts
 
-from swarm_mlp.control import DEFAULT_SIGNAL_TIMEOUT, signal_reduce
-from swarm_mlp.curves import LossCurve
-from swarm_mlp.data import mnist_train_loader
-from swarm_mlp.model import PIPELINE, STAGE_SHAPES
-from swarm_mlp.observability import configure_logging, silence_teardown_noise
-from swarm_mlp.reference import BATCH_SIZE, SEED, EPOCHS
-
-RESULTS_DIR = Path(__file__).resolve().parents[2] / "results"
+from swarm_mlp.distributed_training.control import DEFAULT_SIGNAL_TIMEOUT, signal_reduce
+from swarm_mlp.utils.constants import BATCH_SIZE, EPOCHS, RESULTS_DIR, SEED
+from swarm_mlp.utils.curves import LossCurve
+from swarm_mlp.utils.data import mnist_train_loader
+from swarm_mlp.utils.model import PIPELINE, STAGE_SHAPES
+from swarm_mlp.utils.observability import configure_logging, silence_teardown_noise
 POLL_INTERVAL_FOR_FREE_WORKER = 0.002
+BATCHES_PER_REDUCE = 10
 
 
 def resolve_expert(
@@ -119,13 +118,12 @@ async def train_pipeline(
     replicas: int = 2,
     epochs: int = EPOCHS,
     batch_size: int = BATCH_SIZE,
-    batches_per_reduce: int = 10,
+    batches_per_reduce: int = BATCHES_PER_REDUCE,
     signal_timeout: float = DEFAULT_SIGNAL_TIMEOUT,
     seed: int = SEED,
     max_steps: int | None = None,
     log_every: int = 50,
     resolve_timeout: float = 60.0,
-    dht: hivemind.DHT | None = None,
 ) -> LossCurve:
     """Drive MNIST through a multi-stage, multi-replica pipeline of workers.
 
@@ -146,36 +144,10 @@ async def train_pipeline(
     in a group sees identical weights either way - the two are numerically the
     same, and fusing avoids holding a group's worth of autograd graphs open.
 
-    **Why the first few batches of each group are pinned.** A worker handed no
-    work in a group declines the reduce signal - it has nothing to contribute,
-    and a group in which every peer has weight zero makes hivemind divide by
-    zero and produce NaN gradients in silence. But its peer, which does have
-    samples, then sits in matchmaking waiting for a replica that is never
-    coming, and burns the full averaging timeout before failing the round. Free
-    selection alone permits exactly that (a fast replica taking all ten
-    batches), so each group deals its first ``replicas`` batches round-robin,
-    one to each replica, and only then lets the rest go to whoever is idle.
-    Load-aware for the bulk, guaranteed to close for the barrier.
-
     Computes and returns; writes nothing. The CLI is what persists a curve.
     """
-    if batches_per_reduce < replicas:
-        # Each group deals its first `replicas` batches one per replica; a group
-        # smaller than that leaves some replica with no work, so it declines the
-        # round and its peers wait out the averaging timeout on a group that can
-        # never form. The trailing-group path already refuses this case; the
-        # main path must too.
-        raise ValueError(
-            f"batches_per_reduce ({batches_per_reduce}) must be at least replicas "
-            f"({replicas}), or some replica gets no batch in a group and cannot "
-            "join the all-reduce"
-        )
-
     logger = configure_logging("trainer")
-
-    owns_dht = dht is None
-    if owns_dht:
-        dht = hivemind.DHT(initial_peers=list(initial_peers), start=True)
+    dht = hivemind.DHT(initial_peers=list(initial_peers), start=True)
 
     try:
         started = time.monotonic()
@@ -253,9 +225,8 @@ async def train_pipeline(
             # One backward walks the whole chain: autograd unwinds the last stage's
             # _RemoteModuleCall, which issues its backward RPC, then the previous
             # stage's, and so on back to the input. The gradients land on exactly
-            # the replicas that ran the forward - hivemind recomputes the forward
-            # from the saved inputs, so they could not go anywhere else - and each
-            # worker accumulates them without stepping.
+            # the replicas that ran the forward and each worker accumulates them 
+            # without stepping.
             await asyncio.to_thread(loss.backward)
 
             accuracy = activations.argmax(dim=1).eq(labels).float().mean().item()
@@ -315,10 +286,7 @@ async def train_pipeline(
                     )
                     continue
 
-                # A worker can accept the signal and still decline the round -
-                # it had no samples, or it noticed it had missed one. That is
-                # not an exception, and it used to be invisible: the ack was
-                # built, serialised, sent, and dropped on the floor right here.
+                # A worker can accept the signal and still decline the round.
                 # A stage that keeps declining is a stage whose replicas are
                 # drifting apart, so it is worth a line.
                 report = json.loads(ack.metadata) if ack.metadata else {}
@@ -341,22 +309,27 @@ async def train_pipeline(
                 ordinal += 1
                 if len(group) < batches_per_reduce:
                     continue
-                await _run_group(group, process_batch, replicas)
+                await _run_group(group, process_batch)
                 await signal_group_complete(round_id)
                 round_id += 1
                 group = []
             if group:
-                # A short final group still has to give every replica a batch, or
-                # the stage cannot reach its threshold and the last partial
-                # all-reduce never closes. Dropping it costs at most
-                # batches_per_reduce-1 batches of an epoch.
+                # A trailing group shorter than `replicas` cannot give every
+                # replica a batch, and a replica with no samples declines the
+                # reduce signal - leaving the ones that did get work to wait out
+                # the full averaging_timeout on a group that can never reach
+                # hivemind's min_group_size of 2. Skipping it costs at most
+                # replicas-1 batches per epoch; running it costs a 120s stall
+                # and a failed round. Groups of `replicas` or more need no such
+                # guard: StagePool hands out every replica before repeating.
                 if len(group) >= replicas:
-                    await _run_group(group, process_batch, replicas)
+                    await _run_group(group, process_batch)
                     await signal_group_complete(round_id)
                     round_id += 1
                 else:
                     logger.info(
-                        "dropping a trailing group of %d batches: fewer than %d replicas",
+                        "dropping a trailing group of %d batches: fewer than the "
+                        "%d replicas that must each contribute to a round",
                         len(group),
                         replicas,
                     )
@@ -376,28 +349,19 @@ async def train_pipeline(
         )
         return curve
     finally:
-        if owns_dht:
-            dht.shutdown()
+        dht.shutdown()
 
 
-async def _run_group(group, process_batch, replicas: int) -> None:
-    """Run one all-reduce group's batches concurrently and wait for all of them.
-
-    The first ``replicas`` batches are pinned one per replica so that every
-    worker in every stage takes part in the round; the rest go to whichever
-    replica is idle.
-    """
+async def _run_group(group, process_batch) -> None:
+    """Run one all-reduce group's batches concurrently and wait for all of them."""
     await asyncio.gather(
-        *(
-            process_batch(ordinal, images, labels)
-            for i, (ordinal, images, labels) in enumerate(group)
-        )
+        *(process_batch(ordinal, images, labels) for ordinal, images, labels in group)
     )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="python -m swarm_mlp.trainer",
+        prog="python -m swarm_mlp.distributed_training.trainer",
         description="Sample MNIST batches and drive them through a remote stage.",
     )
     parser.add_argument("--initial-peers", nargs="+", required=True, help="multiaddrs of live peers")

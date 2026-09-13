@@ -14,10 +14,7 @@ import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-# <repo>/data, which .gitignore already excludes. Resolved from this file rather
-# than the cwd because workers and trainers are launched from wherever the
-# operator happens to be standing.
-DATA_ROOT = Path(__file__).resolve().parents[2] / "data"
+from swarm_mlp.utils.constants import DATA_ROOT
 
 # ToTensor() and nothing else, matching the reference article: pixels land in
 # [0, 1] and are not standardised. The usual Normalize((0.1307,), (0.3081,))

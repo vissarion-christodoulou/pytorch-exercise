@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 
-from swarm_mlp.curves import LossCurve
+from swarm_mlp.utils.curves import LossCurve
 
 
 def _sample_curve() -> LossCurve:

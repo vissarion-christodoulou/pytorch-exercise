@@ -2,7 +2,7 @@
 
 A worker owns a stage's weights and nothing else. It never sees a label, never
 computes a loss, and never decides what data to process - it answers requests.
-The trainer decides what to send *and* when to step; the worker only ever
+The trainer decides what to send and when to step; the worker only ever
 accumulates and obeys.
 
 That split is the whole point of this module. hivemind's ``ModuleBackend``
@@ -44,10 +44,10 @@ from hivemind.optim.grad_averager import GradientAverager
 from hivemind.utils import BatchTensorDescriptor
 from hivemind.utils.logging import get_logger
 
-from swarm_mlp.control import ControlServer
-from swarm_mlp.model import STAGE_SHAPES, build_stage
-from swarm_mlp.observability import configure_logging, silence_teardown_noise
-from swarm_mlp.reference import BATCH_SIZE, LEARNING_RATE, SEED
+from swarm_mlp.distributed_training.control import ControlServer
+from swarm_mlp.utils.constants import BATCH_SIZE, LEARNING_RATE, SEED
+from swarm_mlp.utils.model import STAGE_SHAPES, build_stage
+from swarm_mlp.utils.observability import configure_logging, silence_teardown_noise
 
 class StageBackend(ModuleBackend):
     """A pipeline stage that accumulates gradients and steps when it is told to.
@@ -126,7 +126,7 @@ class StageBackend(ModuleBackend):
 
         # get_logger, not configure_logging: the entry point owns global logging
         # setup, and a backend constructed inside a test must not reconfigure it.
-        self._logger = get_logger(f"swarm_mlp.worker.{name}")
+        self._logger = get_logger(f"swarm_mlp.distributed_training.worker.{name}")
 
     def on_backward(self, batch_size: int) -> None:
         """Accumulate this call's gradients. Never steps.
@@ -559,7 +559,7 @@ def serve(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="python -m swarm_mlp.worker",
+        prog="python -m swarm_mlp.distributed_training.worker",
         description="Host one pipeline stage of SimpleMLP as a hivemind peer.",
     )
     parser.add_argument("--stage", default="stage0", help="stage name (default: stage0)")

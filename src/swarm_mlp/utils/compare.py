@@ -13,17 +13,16 @@ import argparse
 import sys
 from pathlib import Path
 
-from swarm_mlp.curves import LossCurve
-from swarm_mlp.observability import configure_logging
-from swarm_mlp.plotting import plot_comparison
-from swarm_mlp.reference import LEARNING_RATE, train_reference
-
-RESULTS_DIR = Path(__file__).resolve().parents[2] / "results"
+from swarm_mlp.baseline_reference.reference import train_reference
+from swarm_mlp.utils.constants import LEARNING_RATE, RESULTS_DIR
+from swarm_mlp.utils.curves import LossCurve
+from swarm_mlp.utils.observability import configure_logging
+from swarm_mlp.utils.plotting import plot_comparison
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="python -m swarm_mlp.compare",
+        prog="python -m swarm_mlp.utils.compare",
         description="Overlay a distributed loss curve on the reference and report the difference.",
     )
     parser.add_argument("distributed", type=Path, help="a curve written by the trainer")
