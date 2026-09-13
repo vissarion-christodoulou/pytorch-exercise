@@ -284,12 +284,12 @@ class StageBackend(ModuleBackend):
                 except (TypeError, ValueError):
                     pass  # keep the fallback below
         except BaseException as error:
-            # This runs on the Runtime thread inside rpc_backward, so an escaping
-            # exception is delivered to the *trainer* as a P2PHandlerError and
-            # takes the whole run down with it. A round that could not find its
-            # peers is a reason to drop one group of gradients, not to stop
-            # training. The replicas may drift apart if this keeps happening -
-            # nothing here re-synchronises weights - so it is logged at ERROR.
+            # This runs under rpc_reduce_now, so an escaping exception is
+            # delivered to the *trainer* as a P2PHandlerError and takes the
+            # whole run down with it. A round that could not find its peers is a
+            # reason to drop one group of gradients, not to stop training. The
+            # replicas may drift apart if this keeps happening - nothing here
+            # re-synchronises weights - so it is logged at ERROR.
             self._logger.error(
                 "all-reduce round failed (%s: %s); dropping %d locally accumulated "
                 "samples and continuing%s",
