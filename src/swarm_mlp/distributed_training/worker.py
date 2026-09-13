@@ -224,8 +224,8 @@ class StageBackend(ModuleBackend):
         # resets them.
         try:
             # weight= is passed explicitly rather than left to default to the
-            # averager's own local_samples_accumulated, which we no longer drive
-            # call-by-call. It is what makes a replica that processed more
+            # averager's own local_samples_accumulated.
+            # It is what makes a replica that processed more
             # samples count proportionally more, and so what keeps the averaged
             # gradient equal to the gradient of the mean loss over every sample
             # the group saw, however unevenly they were split.
