@@ -186,3 +186,73 @@ def plot_comparison(
     fig.savefig(output, dpi=150)
     plt.close(fig)
     return output
+
+
+#: One colour per wire-precision configuration, baseline first.
+ABLATION_COLORS = {
+    "baseline": "#4c72b0",
+    "grad_fp16": "#c44e52",
+    "grad_int8": "#937860",
+    "act_fp16": "#55a868",
+    "act_int8": "#8172b2",
+}
+
+
+def plot_ablation(curves: dict[str, LossCurve], output: Path, *, smooth: int = 25) -> Path:
+    """Overlay every wire-precision configuration, and plot each one's gap to the baseline.
+
+    The third panel is the one worth reading. Drawn on top of each other the five
+    loss curves are indistinguishable - which is itself the headline result - but
+    a picture of five identical lines proves nothing, because it looks the same
+    whether the configurations agree to three decimal places or to eight. The gap
+    to the baseline on a log axis is what separates "no effect" from "an effect
+    too small to see", and it is where the two channels visibly part company.
+    """
+    fig, (loss_ax, acc_ax, delta_ax) = plt.subplots(
+        3, 1, figsize=(9, 11), sharex=True, height_ratios=[3, 2, 3]
+    )
+
+    baseline = curves.get("baseline")
+    for name, curve in curves.items():
+        color = ABLATION_COLORS.get(name, "#666666")
+        width = 2.2 if name == "baseline" else 1.4
+        for ax, series in ((loss_ax, curve.loss), (acc_ax, curve.accuracy)):
+            ax.plot(curve.samples, series, color=color, alpha=0.12, linewidth=0.7)
+            ax.plot(curve.samples, rolling_mean(series, smooth), color=color,
+                    linewidth=width, label=name)
+
+        if baseline is None or name == "baseline":
+            continue
+        # Against the baseline rather than the single-process reference: this is
+        # an ablation, so the quantity of interest is what the knob changed, not
+        # what the distributed system costs.
+        common = min(len(baseline), len(curve))
+        delta = np.abs(
+            np.asarray(baseline.loss[:common]) - np.asarray(curve.loss[:common])
+        )
+        delta_ax.semilogy(
+            curve.samples[:common],
+            np.maximum(rolling_mean(list(delta), smooth), 1e-12),
+            color=color,
+            linewidth=1.4,
+            label=name,
+        )
+
+    loss_ax.set_ylabel("cross-entropy loss")
+    loss_ax.set_title(f"Wire precision (lines are means of {smooth} batches)")
+    loss_ax.legend(loc="upper right")
+    loss_ax.grid(alpha=0.3)
+
+    acc_ax.set_ylabel("batch accuracy")
+    acc_ax.grid(alpha=0.3)
+
+    delta_ax.set_ylabel("|loss - baseline loss|")
+    delta_ax.set_xlabel("samples consumed")
+    delta_ax.legend(loc="upper right")
+    delta_ax.grid(alpha=0.3, which="both")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(output, dpi=150)
+    plt.close(fig)
+    return output

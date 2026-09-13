@@ -58,6 +58,11 @@ from swarm_mlp.distributed_training.constants import (
     WORKER_SERVER_UPDATE_PERIOD,
 )
 from swarm_mlp.distributed_training.control import ControlServer
+from swarm_mlp.distributed_training.precision import (
+    ACTIVATION_PRECISIONS,
+    GRADIENT_PRECISIONS,
+    enable_int8,
+)
 from swarm_mlp.utils.constants import (
     BATCH_SIZE,
     CURVE_TIMESTAMP_FORMAT,
@@ -364,6 +369,8 @@ def serve(
     learning_rate: float = LEARNING_RATE,
     stats_interval: float | None = None,
     max_batch_size: int = BATCH_SIZE,
+    activation_precision: str = "fp32",
+    gradient_precision: str = "fp32",
 ) -> tuple[hivemind.DHT, Server, StageBackend]:
     """Start a worker hosting ``<stage>.<index>`` and return its parts.
 
@@ -403,6 +410,9 @@ def serve(
         # runs; the ordering constraint between these two is in constants.py.
         min_matchmaking_time=MIN_MATCHMAKING_TIME,
         request_timeout=REQUEST_TIMEOUT,
+        # Types the gradients on the replica all-reduce, and nothing else:
+        # accumulation and Adam stay float32 whatever this says.
+        compression=GRADIENT_PRECISIONS[gradient_precision],
         # Set this to the number of replicas hosting the stage and an
         # all-reduce round closes the moment they have all arrived, instead
         # of waiting out the declared expiration: hivemind's shortcut in
@@ -413,12 +423,18 @@ def serve(
     )
 
     in_shape, out_shape = STAGE_SHAPES[stage]
+    # Types every tensor on the trainer/worker RPCs. hivemind publishes the
+    # schema, so declaring it here also makes the trainer serialise to match -
+    # args_schema covers the forward request, the input re-sent on backward and
+    # the backward response; outputs_schema covers the forward response and the
+    # output gradients sent on backward. Between them, all four legs.
+    activations = ACTIVATION_PRECISIONS[activation_precision]
     backend = StageBackend(
         uid,
         module,
         optimizer=torch.optim.Adam(module.parameters(), lr=learning_rate),
-        args_schema=(BatchTensorDescriptor(*in_shape),),
-        outputs_schema=BatchTensorDescriptor(*out_shape),
+        args_schema=(BatchTensorDescriptor(*in_shape, compression=activations),),
+        outputs_schema=BatchTensorDescriptor(*out_shape, compression=activations),
         grad_averager=grad_averager,
         max_batch_size=max_batch_size, # processing multiple batches at once affects the average loss calculation
     )
@@ -494,6 +510,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE)
     parser.add_argument(
+        "--activation-precision",
+        choices=sorted(ACTIVATION_PRECISIONS),
+        default="fp32",
+        help="wire precision for the trainer/worker RPCs (default: fp32)",
+    )
+    parser.add_argument(
+        "--gradient-precision",
+        choices=sorted(GRADIENT_PRECISIONS),
+        default="fp32",
+        help="wire precision for the replica all-reduce (default: fp32)",
+    )
+    parser.add_argument(
         "--stats-interval",
         type=float,
         default=None,
@@ -507,6 +535,7 @@ def main() -> None:
     args = parse_args()
     logger = configure_logging(f"worker[{args.stage}.{args.index}]", args.log_level)
     silence_teardown_noise()
+    enable_int8()
 
     dht, server, backend = serve(
         stage=args.stage,
@@ -514,6 +543,11 @@ def main() -> None:
         learning_rate=args.learning_rate,
         stats_interval=args.stats_interval,
         max_batch_size=args.batch_size,
+        activation_precision=args.activation_precision,
+        gradient_precision=args.gradient_precision,
+    )
+    logger.info(
+        "activations %s, gradients %s", args.activation_precision, args.gradient_precision
     )
 
     stop = threading.Event()

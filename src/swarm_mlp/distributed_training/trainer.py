@@ -43,6 +43,7 @@ from swarm_mlp.distributed_training.constants import (
     RESOLVE_EXPERT_TIMEOUT, 
     TRAINER_LOG_EVERY
 )
+from swarm_mlp.distributed_training.precision import enable_int8
 from swarm_mlp.distributed_training.control import DEFAULT_SIGNAL_TIMEOUT, signal_reduce
 from swarm_mlp.utils.constants import (
     BATCH_SIZE,
@@ -397,6 +398,10 @@ def main() -> None:
     args = parse_args()
     logger = configure_logging("trainer", args.log_level)
     silence_teardown_noise()
+    # The trainer never chooses a precision - the worker's published schema does
+    # that - but it is on the receiving end of every activation, so it needs the
+    # 8-bit decoder to work here too.
+    enable_int8()
 
     curve = asyncio.run(
         train_pipeline(
