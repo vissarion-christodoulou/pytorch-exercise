@@ -121,14 +121,8 @@ class StageBackend(ModuleBackend):
         self.last_grad_norm = float("nan")
 
         self._params = [p for p in module.parameters() if p.requires_grad]
-        # Private accumulators in BOTH modes. Delegating accumulation to
-        # GradientAverager looks tidier but is wrong for variable batch sizes:
-        # accumulate_grads_ scales each call by batch_size/anchor_batch_size
-        # (the FIRST batch of the round) and load_accumulators_into_averager_
-        # divides by the NUMBER of calls, so what reaches the all-reduce is
-        # (mean_batch / first_batch) times the true mean gradient. Equal batches
-        # hide it; hivemind's own Optimizer always passes a constant
-        # batch_size_per_step, which is why the library gets away with it.
+        # Private accumulators: Delegating accumulation to
+        # GradientAverager looks tidier but is wrong for variable batch sizes
         self._accumulators = [torch.zeros_like(p) for p in self._params]
 
         # get_logger, not configure_logging: the entry point owns global logging
@@ -252,12 +246,7 @@ class StageBackend(ModuleBackend):
             # the group saw, however unevenly they were split.
             # The return value is the gathered data from everyone in the group,
             # so its length is the REAL group size.
-            # `gather` rides along with matchmaking and comes back as a dict of
-            # peer -> that peer's payload, so sending our own sample count is
-            # what lets every replica report the TRUE collective batch size
-            # rather than guessing from a gossiped estimate. It is also the
-            # number the assignment actually asks about: how many samples the
-            # stage collectively saw before it stepped.
+            # `gather` makes the function return a dict of {peer, gather_value}
             gathered = self.grad_averager.step(
                 weight=float(local_samples),
                 gather=local_samples,
