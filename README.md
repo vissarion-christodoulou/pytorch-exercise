@@ -107,7 +107,8 @@ I have opted for simplicity in a number of cases to focus on producing a Proof o
 </li>
   <li>The all-reduce is triggered once all stages are done propagating (harming speed)</li>
   <li>A worker crashing or losing synchronization with peers causes the trainer to do and lives other workers "orphaned" (harming reliability)</li>
-  <li><code>src/swarm_mlp/distributed_training/constants.py</code> holds some constants such as polling timeouts, not configurable by the trainers/workers to avoid passing around parameters. Selectd values should be fine for all cases, but feel free to change on local run if they cause an issue.</li>
+  <li><code>src/swarm_mlp/distributed_training/constants.py</code> holds some constants such as polling timeouts, not configurable by the trainers/workers to avoid passing around parameters. Selected values should be fine for all cases, but feel free to change on local run if they cause an issue.</li>
+  <li>Trainer is informed about all workers. No DHT discovery</li>
 </ol>
 
 

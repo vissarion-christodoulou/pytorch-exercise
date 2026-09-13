@@ -37,7 +37,7 @@ import hivemind
 from hivemind.moe.server import get_experts
 
 from swarm_mlp.distributed_training.constants import (
-    BATCHES_PER_REDUCE,
+    DEFAULT_BATCHES_PER_REDUCE,
     POLL_INTERVAL_FOR_FREE_WORKER, 
     REPLICAS_PER_STAGE,
     RESOLVE_EXPERT_TIMEOUT, 
@@ -128,8 +128,7 @@ async def train_pipeline(
     initial_peers: Sequence[str],
     epochs: int = EPOCHS,
     batch_size: int = BATCH_SIZE,
-    batches_per_reduce: int = BATCHES_PER_REDUCE,
-    resolve_timeout: float = 60.0,
+    batches_per_reduce: int = DEFAULT_BATCHES_PER_REDUCE,
 ) -> LossCurve:
     """Drive MNIST through a multi-stage, multi-replica pipeline of workers.
 

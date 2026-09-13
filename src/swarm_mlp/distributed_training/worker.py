@@ -32,7 +32,6 @@ import argparse
 import math
 import signal
 import threading
-from typing import Sequence
 
 import torch
 import torch.nn as nn
@@ -44,7 +43,15 @@ from hivemind.optim.grad_averager import GradientAverager
 from hivemind.utils import BatchTensorDescriptor
 from hivemind.utils.logging import get_logger
 
-from swarm_mlp.distributed_training.constants import NUM_WORKER_HANDLERS, REPLICAS_PER_STAGE
+from swarm_mlp.distributed_training.constants import (
+    AVERAGING_TIMEOUT,
+    HOST_MADDRS,
+    MIN_MATCHMAKING_TIME,
+    NUM_WORKER_HANDLERS,
+    REPLICAS_PER_STAGE,
+    REQUEST_TIMEOUT,
+    WORKER_SERVER_UPDATE_PERIOD,
+)
 from swarm_mlp.distributed_training.control import ControlServer
 from swarm_mlp.utils.constants import BATCH_SIZE, LEARNING_RATE, SEED
 from swarm_mlp.utils.model import STAGE_SHAPES, build_stage
@@ -74,7 +81,6 @@ class StageBackend(ModuleBackend):
         args_schema: tuple[BatchTensorDescriptor, ...],
         outputs_schema: BatchTensorDescriptor,
         grad_averager: GradientAverager,
-        averaging_timeout: float = 120.0,
         **pool_kwargs,
     ) -> None:
         super().__init__(
@@ -87,7 +93,6 @@ class StageBackend(ModuleBackend):
         )
         self.optimizer = optimizer
         self.grad_averager = grad_averager
-        self.averaging_timeout = averaging_timeout
         # Set before the averager is torn down. The Server thread
         # can still deliver a backward after that point, and touching a dead
         # averager blocks forever on an MPFuture whose owner process is gone.
@@ -95,7 +100,7 @@ class StageBackend(ModuleBackend):
         # shutdown_averaging acquires it to
         # wait out an all-reduce already in flight before killing the averager
         # that round is using. Without that the worker hung for the full
-        # averaging_timeout and went deaf to Ctrl+C.
+        # AVERAGING_TIMEOUT and went deaf to Ctrl+C.
         #
         # Holding it across the accumulation keeps the invariant local, too.
         # "No backward overlaps a reduce" is a property of the *trainer*,
@@ -237,7 +242,7 @@ class StageBackend(ModuleBackend):
         gathered = self.grad_averager.step(
             weight=float(local_samples),
             gather=local_samples,
-            timeout=self.averaging_timeout,
+            timeout=AVERAGING_TIMEOUT,
         )
         group_size = len(gathered) if hasattr(gathered, "__len__") else 1
         if isinstance(gathered, dict) and gathered:
@@ -305,7 +310,7 @@ class StageBackend(ModuleBackend):
         # it: the loop's executor is shut down with wait=False and the round
         # keeps going, holding _step_lock, against a GradientAverager we are
         # about to kill. That left the worker unable to exit for the full
-        # averaging_timeout and deaf to Ctrl+C. Taking the lock first means the
+        # AVERAGING_TIMEOUT and deaf to Ctrl+C. Taking the lock first means the
         # round either finishes or raises its own timeout while the averager it
         # depends on is still alive.
         acquired = self._step_lock.acquire(timeout=shutdown_grace)
@@ -345,17 +350,9 @@ def serve(
     *,
     stage: str,
     index: int,
-    initial_peers: Sequence[str] = (),
-    host_maddrs: Sequence[str] = ("/ip4/127.0.0.1/tcp/0",),
-    identity_path: str | None = None,
     learning_rate: float = LEARNING_RATE,
-    seed: int = SEED,
-    update_period: float = 5.0,
     stats_interval: float | None = None,
     max_batch_size: int = BATCH_SIZE,
-    min_matchmaking_time: float = 0.05,
-    request_timeout: float = 0.04,
-    averaging_timeout: float = 120.0,
 ) -> tuple[hivemind.DHT, Server, StageBackend]:
     """Start a worker hosting ``<stage>.<index>`` and return its parts.
 
@@ -375,31 +372,14 @@ def serve(
     uid = f"{stage}.{index}"
     if not is_valid_uid(uid):
         raise ValueError(f"{uid!r} is not a valid hivemind expert uid (expected <prefix>.<int>)")
-    if request_timeout >= min_matchmaking_time:
-        raise ValueError(
-            f"request_timeout ({request_timeout}) must be smaller than min_matchmaking_time "
-            f"({min_matchmaking_time}) or averaging rounds will fail; see hivemind's Matchmaking docstring"
-        )
-    if min_matchmaking_time >= averaging_timeout:
-        # DecentralizedAverager.step asserts scheduled_time < deadline, where
-        # scheduled_time is now + min_matchmaking_time and deadline is now +
-        # timeout, so this combination fails every round before any network work.
-        raise ValueError(
-            f"min_matchmaking_time ({min_matchmaking_time}) must be smaller than "
-            f"averaging_timeout ({averaging_timeout}) or every round raises immediately"
-        )
     if stage not in STAGE_SHAPES:
         raise ValueError(f"unknown stage {stage!r}; known stages: {sorted(STAGE_SHAPES)}")
 
     logger = configure_logging(f"worker[{uid}]")
 
-    module = build_stage(stage, seed)
+    module = build_stage(stage, SEED)
 
-    dht_kwargs = {"host_maddrs": list(host_maddrs), "start": True}
-    if initial_peers:
-        dht_kwargs["initial_peers"] = list(initial_peers)
-    if identity_path is not None:
-        dht_kwargs["identity_path"] = identity_path
+    dht_kwargs = {"host_maddrs": HOST_MADDRS, "start": True}
     dht = hivemind.DHT(**dht_kwargs)
 
     # The key is namespaced by stage, so stage0's replicas form one all-reduce
@@ -408,11 +388,10 @@ def serve(
         module.parameters(),
         dht=dht,
         prefix=f"{stage}_grads",
-        # High matchmaking per round can dominate wall-clock for small local 
-        # runs. But it must be at least request_timeout to avoid matchmaking
-        # deadlocks in hivemind
-        min_matchmaking_time=min_matchmaking_time,
-        request_timeout=request_timeout,
+        # High matchmaking per round can dominate wall-clock for small local
+        # runs; the ordering constraint between these two is in constants.py.
+        min_matchmaking_time=MIN_MATCHMAKING_TIME,
+        request_timeout=REQUEST_TIMEOUT,
         # Set this to the number of replicas hosting the stage and an
         # all-reduce round closes the moment they have all arrived, instead
         # of waiting out the declared expiration: hivemind's shortcut in
@@ -430,7 +409,6 @@ def serve(
         args_schema=(BatchTensorDescriptor(*in_shape),),
         outputs_schema=BatchTensorDescriptor(*out_shape),
         grad_averager=grad_averager,
-        averaging_timeout=averaging_timeout,
         max_batch_size=max_batch_size, # processing multiple batches at once affects the average loss calculation
     )
 
@@ -440,7 +418,7 @@ def serve(
         dht,
         {uid: backend},
         num_connection_handlers=NUM_WORKER_HANDLERS,
-        update_period=update_period,
+        update_period=WORKER_SERVER_UPDATE_PERIOD,
         device=torch.device("cpu"),
         stats_report_interval=stats_interval,
         start=True,
@@ -467,9 +445,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--stage", default="stage0", help="stage name (default: stage0)")
     parser.add_argument("--index", type=int, default=0, help="replica index within the stage")
-    parser.add_argument("--initial-peers", nargs="*", default=[], help="multiaddrs of live peers")
-    parser.add_argument("--host-maddrs", nargs="*", default=["/ip4/127.0.0.1/tcp/0"])
-    parser.add_argument("--identity-path", default=None, help="private key file for a stable PeerID")
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -478,22 +453,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         f"backwards are never merged into one call (default: {BATCH_SIZE})",
     )
     parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE)
-    parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--update-period", type=float, default=5.0)
-    parser.add_argument(
-        "--min-matchmaking-time",
-        type=float,
-        default=2,
-        help="seconds each all-reduce round spends looking for peers (hivemind default: 5); "
-        "must be larger than --request-timeout",
-    )
-    parser.add_argument(
-        "--request-timeout",
-        type=float,
-        default=1,
-        help="seconds for a single matchmaking request (hivemind default: 3)",
-    )
-    parser.add_argument("--averaging-timeout", type=float, default=120.0)
     parser.add_argument(
         "--stats-interval",
         type=float,
@@ -512,17 +471,9 @@ def main() -> None:
     dht, server, backend = serve(
         stage=args.stage,
         index=args.index,
-        initial_peers=args.initial_peers,
-        host_maddrs=args.host_maddrs,
-        identity_path=args.identity_path,
         learning_rate=args.learning_rate,
-        seed=args.seed,
-        update_period=args.update_period,
         stats_interval=args.stats_interval,
         max_batch_size=args.batch_size,
-        min_matchmaking_time=args.min_matchmaking_time,
-        request_timeout=args.request_timeout,
-        averaging_timeout=args.averaging_timeout,
     )
 
     stop = threading.Event()
