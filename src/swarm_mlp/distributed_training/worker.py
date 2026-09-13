@@ -17,8 +17,10 @@ stay there; the trainer, which dealt the batches and so is the only party that
 knows the group's exact total, signals the round over the control channel. On
 that signal the worker all-reduces with the other replicas of its stage through
 a ``hivemind.optim.GradientAverager`` and steps. Replicas begin from identical
-weights and apply identical averaged gradients, so they stay identical without
-ever exchanging parameters.
+weights and apply the same averaged gradient, so they stay in lockstep without
+ever exchanging parameters - to within float32 rounding, which is as close as
+hivemind's delta-based all-reduce allows. ``python -m swarm_mlp.distributed_training``
+measures the gap after a run and explains where it comes from.
 
 The all-reduce blocks, which is the sharpest constraint on the system: a worker
 in the middle of one is serving nothing. It is safe only because the trainer
@@ -29,9 +31,12 @@ barrier together. See ``trainer.py`` for the other half of that argument.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import signal
 import threading
+import time
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -53,7 +58,13 @@ from swarm_mlp.distributed_training.constants import (
     WORKER_SERVER_UPDATE_PERIOD,
 )
 from swarm_mlp.distributed_training.control import ControlServer
-from swarm_mlp.utils.constants import BATCH_SIZE, LEARNING_RATE, SEED
+from swarm_mlp.utils.constants import (
+    BATCH_SIZE,
+    CURVE_TIMESTAMP_FORMAT,
+    LEARNING_RATE,
+    RESULTS_DIR,
+    SEED,
+)
 from swarm_mlp.utils.model import STAGE_SHAPES, build_stage
 from swarm_mlp.utils.observability import configure_logging, silence_teardown_noise
 
@@ -438,6 +449,43 @@ def serve(
     return dht, server, backend
 
 
+def dump_parameters(backend: StageBackend, stage: str, index: int) -> Path:
+    """Write this stage's final weights to ``results/worker_<stage>_<index>_<ts>.json``.
+
+    The system's central claim is that two replicas of a stage never exchange
+    parameters and stay identical anyway, because they apply the same averaged
+    gradient to the same starting point. That is a claim about the weights, and
+    the logs cannot settle it - a round that silently stepped on an unaveraged
+    gradient still logs a step. So each worker states its final position and
+    ``python -m swarm_mlp.distributed_training`` checks the pairs.
+
+    JSON rather than a state dict, because the point is to be readable by
+    something that is not this program. The format loses nothing: a float32
+    widens to a Python float losslessly, and ``json`` writes ``repr()``, which
+    parses back to the same double. So any difference the checker reports is a
+    difference between the workers, never an artefact of writing them down.
+
+    Values are flattened and the shape recorded beside them - a 256x784 matrix
+    as nested lists costs several times more to write and to parse, and the
+    checker only ever walks them in order.
+    """
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = RESULTS_DIR / f"worker_{stage}_{index}_{time.strftime(CURVE_TIMESTAMP_FORMAT)}.json"
+    payload = {
+        "stage": stage,
+        "index": index,
+        "steps": backend.steps,
+        "averaging_rounds": backend.averaging_rounds,
+        "samples_total": backend.samples_total,
+        "params": {
+            name: {"shape": list(param.shape), "values": param.detach().flatten().tolist()}
+            for name, param in backend.module.named_parameters()
+        },
+    }
+    path.write_text(json.dumps(payload))
+    return path
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m swarm_mlp.distributed_training.worker",
@@ -487,11 +535,20 @@ def main() -> None:
             if args.stats_interval:
                 logger.info("stats: %s", backend.get_stats())
     finally:
+        # Before the dump, so no all-reduce is still in flight: the weights
+        # written below are the ones the last completed round produced.
         backend.shutdown_averaging()
-        # Shuts down the DHT too. Expect a second "Server shutdown successfully"
-        # and one "ConnectionHandler ... already dead" warning: our call makes
-        # Runtime.run return, and Server.run's own finally then shuts down again.
-        server.shutdown()
+        try:
+            logger.info("weights written to %s", dump_parameters(backend, args.stage, args.index))
+        finally:
+            # Nested so a failure to serialise still cannot leave the server and
+            # its p2pd child running.
+            #
+            # Shuts down the DHT too. Expect a second "Server shutdown
+            # successfully" and one "ConnectionHandler ... already dead"
+            # warning: our call makes Runtime.run return, and Server.run's own
+            # finally then shuts down again.
+            server.shutdown()
         logger.info(
             "worker stopped after %d steps (%d all-reduce rounds), %d samples",
             backend.steps,
