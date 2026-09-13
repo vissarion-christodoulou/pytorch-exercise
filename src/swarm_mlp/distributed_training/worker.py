@@ -1,0 +1,587 @@
+"""The worker service: hosts one pipeline stage and serves forward/backward.
+
+A worker owns a stage's weights and nothing else. It never sees a label, never
+computes a loss, and never decides what data to process - it answers requests.
+The trainer decides what to send and when to step; the worker only ever
+accumulates and obeys.
+
+That split is the whole point of this module. hivemind's ``ModuleBackend``
+applies its optimiser after *every* backward call, which would make each remote
+micro-batch its own optimiser step. The assignment needs the opposite:
+accumulate, and step only once the workers of this stage have *collectively*
+seen a whole group of batches - at which point they all-reduce their gradients
+with each other and step together.
+
+``StageBackend`` below is that inversion. Backwards land in private buffers and
+stay there; the trainer, which dealt the batches and so is the only party that
+knows the group's exact total, signals the round over the control channel. On
+that signal the worker all-reduces with the other replicas of its stage through
+a ``hivemind.optim.GradientAverager`` and steps. Replicas begin from identical
+weights and apply the same averaged gradient, so they stay in lockstep without
+ever exchanging parameters - to within float32 rounding, which is as close as
+hivemind's delta-based all-reduce allows. ``python -m swarm_mlp.distributed_training``
+measures the gap after a run and explains where it comes from.
+
+The all-reduce blocks, which is the sharpest constraint on the system: a worker
+in the middle of one is serving nothing. It is safe only because the trainer
+signals every replica of a stage at the same instant, so they arrive at the
+barrier together. See ``trainer.py`` for the other half of that argument.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import signal
+import threading
+import time
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+
+import hivemind
+from hivemind.moe.expert_uid import is_valid_uid
+from hivemind.moe.server import ModuleBackend, Server
+from hivemind.optim.grad_averager import GradientAverager
+from hivemind.utils import BatchTensorDescriptor
+from hivemind.utils.logging import get_logger
+
+from swarm_mlp.distributed_training.constants import (
+    AVERAGING_TIMEOUT,
+    HOST_MADDRS,
+    MIN_MATCHMAKING_TIME,
+    NUM_WORKER_HANDLERS,
+    REPLICAS_PER_STAGE,
+    REQUEST_TIMEOUT,
+    WORKER_SERVER_UPDATE_PERIOD,
+)
+from swarm_mlp.distributed_training.control import ControlServer
+from swarm_mlp.distributed_training.precision import (
+    ACTIVATION_PRECISIONS,
+    GRADIENT_PRECISIONS,
+    enable_int8,
+)
+from swarm_mlp.utils.constants import (
+    BATCH_SIZE,
+    CURVE_TIMESTAMP_FORMAT,
+    LEARNING_RATE,
+    RESULTS_DIR,
+    SEED,
+)
+from swarm_mlp.utils.model import STAGE_SHAPES, build_stage
+from swarm_mlp.utils.observability import configure_logging, silence_teardown_noise
+
+class StageBackend(ModuleBackend):
+    """A pipeline stage that accumulates gradients and steps when it is told to.
+
+    hivemind's ``ModuleBackend.on_backward`` steps the optimiser after every
+    backward call. This subclass accumulates instead and never decides to step
+    on its own: ``reduce_now`` is the only path to the optimiser, and only the
+    trainer calls it. The threshold lives in the trainer because the trainer is
+    the only party that can see what the whole group has processed.
+
+    The optimiser is held here rather than passed to ``ModuleBackend.__init__``
+    so that no base-class code path can reach it: the base class treats an
+    optimiser as something to step, and this class treats it as something only
+    a reduce signal may step.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        module: nn.Module,
+        *,
+        optimizer: torch.optim.Optimizer,
+        args_schema: tuple[BatchTensorDescriptor, ...],
+        outputs_schema: BatchTensorDescriptor,
+        grad_averager: GradientAverager,
+        **pool_kwargs,
+    ) -> None:
+        super().__init__(
+            name,
+            module,
+            optimizer=None,
+            args_schema=args_schema,
+            outputs_schema=outputs_schema,
+            **pool_kwargs,
+        )
+        self.optimizer = optimizer
+        self.grad_averager = grad_averager
+        # Set before the averager is torn down. The Server thread
+        # can still deliver a backward after that point, and touching a dead
+        # averager blocks forever on an MPFuture whose owner process is gone.
+        self._stopping = threading.Event()
+        # shutdown_averaging acquires it to
+        # wait out an all-reduce already in flight before killing the averager
+        # that round is using. Without that the worker hung for the full
+        # AVERAGING_TIMEOUT and went deaf to Ctrl+C.
+        #
+        # Holding it across the accumulation keeps the invariant local, too.
+        # "No backward overlaps a reduce" is a property of the *trainer*,
+        # enforced by nothing on this side of the wire: a retry added to
+        # signal_group_complete, or a second trainer pointed at this worker,
+        # would break it silently and corrupt the accumulators. An uncontended
+        # RLock per batch is not a price worth haggling over to find that out.
+        self._step_lock = threading.RLock()
+        #: set by serve(); owns the thread serving rpc_reduce_now
+        self.control: object | None = None
+        #: last round id the trainer successfully drove us through
+        self.last_round = -1
+        self.missed_rounds = 0
+
+        self.samples_since_step = 0
+        self.samples_total = 0
+        self.backward_calls = 0
+        self.steps = 0
+        self.averaging_rounds = 0
+        self.failed_rounds = 0
+        self.solo_rounds = 0
+        self.last_effective_batch = 0
+        self.last_group_size = 0
+        self.last_grad_norm = float("nan")
+
+        self._params = [p for p in module.parameters() if p.requires_grad]
+        # Private accumulators: Delegating accumulation to
+        # GradientAverager looks tidier but is wrong for variable batch sizes
+        self._accumulators = [torch.zeros_like(p) for p in self._params]
+
+        # get_logger, not configure_logging: the entry point owns global logging
+        # setup, and a backend constructed inside a test must not reconfigure it.
+        self._logger = get_logger(f"swarm_mlp.distributed_training.worker.{name}")
+
+    def on_backward(self, batch_size: int) -> None:
+        """Accumulate this call's gradients. Never steps.
+
+        Called by hivemind's ``Runtime`` loop, which runs in the Server thread of
+        the main process, and the only caller on that thread. 
+
+        The gradients stay here until the trainer - which dealt the batches and
+        therefore knows the exact total - says the group is complete.
+
+        **Why the gradients are weighted by ``batch_size``.** The trainer's loss
+        uses ``reduction="mean"``, so the gradient arriving from each backward is
+        already divided by *that call's* batch size. Summing the gradients of a
+        16-sample and a 48-sample batch and halving them would weight the small
+        batch three times too heavily. Scaling each by its own batch size and
+        dividing the total by the sample count reproduces exactly the gradient of
+        the mean loss over all of them.
+        """
+        with self._step_lock:
+            self._on_backward_locked(batch_size)
+
+    def _on_backward_locked(self, batch_size: int) -> None:
+        self.samples_since_step += batch_size
+        self.samples_total += batch_size
+        self.backward_calls += 1
+
+        if self._stopping.is_set():
+            return  # shutting down: accumulate nothing, join no barrier
+
+        self._accumulate(batch_size)
+
+    def _accumulate(self, batch_size: int) -> None:
+        for param, accumulator in zip(self._params, self._accumulators):
+            if param.grad is not None:
+                accumulator.add_(param.grad, alpha=float(batch_size))
+                param.grad = None
+
+    def reduce_now(self, round_id: int = -1) -> dict:
+        """All-reduce and step because the trainer says the group is complete.
+
+        Called from the control channel's thread (see ``control.py``), never
+        from the Runtime thread. Returns a small dict that becomes the trainer's
+        ack, so a caller can tell a real round from a no-op.
+        """
+        with self._step_lock:
+            if self._stopping.is_set():
+                return {"reduced": False, "reason": "worker is shutting down"}
+            if self.samples_since_step == 0:
+                self._logger.error("no steps recorded in round %d", self.last_round + 1)
+                return {"reduced": False, "reason": "No steps recorded", "round": round_id}
+            if 0 <= self.last_round < round_id - 1:
+                self._logger.error(
+                    "missed round(s) %d..%d - the group stepped without us. Discarding "
+                    "%d stale samples. NOTE: our weights are now behind our peers' and "
+                    "nothing here resynchronises them",
+                    self.last_round + 1,
+                    round_id - 1,
+                    self.samples_since_step,
+                )
+                return {"reduced": False, "reason": "missed a round", "round": round_id}
+
+            samples = self.samples_since_step
+            before = self.steps
+            try:
+                self._all_reduce_and_step()
+            except BaseException as e:
+                return {"reduced": False, "reason": f"missed a round: {str(e)}", "round": round_id}
+            self.last_round = round_id
+            return {
+                "reduced": self.steps > before,
+                "round": round_id,
+                "samples": samples,
+                "steps": self.steps,
+                "failed_rounds": self.failed_rounds,
+            }
+
+    def _all_reduce_and_step(self) -> None:
+        """All-reduce with this stage's other replicas, then step. Blocks."""
+
+        local_samples = self.samples_since_step
+        # A fallback only: the real collective total is recovered from the
+        # averaging round's `gather` below, which is exact. This value survives
+        # only if that gather comes back in a shape we cannot sum.
+        group_samples = local_samples
+
+        # Finish the mean ourselves, then give the averager a single
+        # accumulation of it: with one call the anchor equals the batch size and
+        # the call count is 1, so both of hivemind's internal scalings collapse
+        # to the identity and what we computed is exactly what gets reduced.
+        for param, accumulator in zip(self._params, self._accumulators):
+            param.grad = accumulator / local_samples
+        self.grad_averager.accumulate_grads_(batch_size=local_samples)
+
+        # Blocks until the other replicas of this stage arrive at the same
+        # barrier. step() also loads the accumulators into the averager and
+        # resets them.
+        # weight= is passed explicitly rather than left to default to the
+        # averager's own local_samples_accumulated.
+        # It is what makes a replica that processed more
+        # samples count proportionally more, and so what keeps the averaged
+        # gradient equal to the gradient of the mean loss over every sample
+        # the group saw, however unevenly they were split.
+        # The return value is the gathered data from everyone in the group,
+        # so its length is the REAL group size.
+        # `gather` makes the function return a dict of {peer, gather_value}
+        gathered = self.grad_averager.step(
+            weight=float(local_samples),
+            gather=local_samples,
+            timeout=AVERAGING_TIMEOUT,
+        )
+        group_size = len(gathered) if hasattr(gathered, "__len__") else 1
+        if isinstance(gathered, dict) and gathered:
+            try:
+                group_samples = sum(int(v) for v in gathered.values())
+            except (TypeError, ValueError):
+                pass  # keep the fallback below
+
+        with self.grad_averager.use_averaged_gradients():
+            sum_of_squares = sum(
+                float(p.grad.pow(2).sum()) for p in self._params if p.grad is not None
+            )
+            self.last_grad_norm = math.sqrt(sum_of_squares)
+            self.optimizer.step()
+
+        self._reset_accumulators()
+        self.averaging_rounds += 1
+        if group_size < 2:
+            # Averaging "succeeded" with nobody else in the group, so this step
+            # applied only our own gradient.
+            self.solo_rounds += 1
+            self._logger.error(
+                "all-reduce round completed with a group of %d: this step was NOT "
+                "averaged and the replicas of this stage have diverged",
+                group_size,
+            )
+            raise BaseException("Worker stepped on local weights only")
+        self._finish_step(group_samples, group_size=group_size, local_samples=local_samples)
+
+    # ----------------------------------------------------------------- shared
+
+    def _reset_accumulators(self) -> None:
+        for param, accumulator in zip(self._params, self._accumulators):
+            param.grad = None
+            accumulator.zero_()
+
+    def _finish_step(self, effective_batch: int, *, group_size: int, local_samples: int) -> None:
+        self.steps += 1
+        self.last_effective_batch = effective_batch
+        self.last_group_size = group_size
+        self.samples_since_step = 0
+
+        self._logger.info(
+            "step %d  all-reduced with %d peers  group_batch %d (ours %d)  "
+            "samples_total %d  grad_norm %.4f",
+            self.steps,
+            group_size,
+            effective_batch,
+            local_samples,
+            self.samples_total,
+            self.last_grad_norm,
+        )
+
+    def shutdown_averaging(self, shutdown_grace: float = 15.0) -> None:
+        """Stop the control channel and averager, in that order.
+
+        Order matters: the control channel must stop accepting reduce signals
+        before the averager it would drive is torn down, and both must go before
+        the DHT they depend on.
+        """
+        self._stopping.set()
+
+        # Wait - bounded - for any round already running. rpc_reduce_now hands
+        # the all-reduce to a thread, so stopping the control loop does NOT stop
+        # it: the loop's executor is shut down with wait=False and the round
+        # keeps going, holding _step_lock, against a GradientAverager we are
+        # about to kill. That left the worker unable to exit for the full
+        # AVERAGING_TIMEOUT and deaf to Ctrl+C. Taking the lock first means the
+        # round either finishes or raises its own timeout while the averager it
+        # depends on is still alive.
+        acquired = self._step_lock.acquire(timeout=shutdown_grace)
+        if not acquired:
+            self._logger.warning(
+                "an all-reduce was still running after %.0fs; shutting down anyway",
+                shutdown_grace,
+            )
+        try:
+            self._shutdown_collectives()
+        finally:
+            if acquired:
+                self._step_lock.release()
+
+    def _shutdown_collectives(self) -> None:
+        if self.control is not None:
+            self.control.shutdown()
+        self.grad_averager.shutdown()
+
+    def get_stats(self) -> dict[str, int]:
+        """Counters for the periodic report under ``--stats-interval``"""
+        return {
+            "steps": self.steps,
+            "samples_total": self.samples_total,
+            "samples_since_step": self.samples_since_step,
+            "backward_calls": self.backward_calls,
+            "last_effective_batch": self.last_effective_batch,
+            "averaging_rounds": self.averaging_rounds,
+            "failed_rounds": self.failed_rounds,
+            "missed_rounds": self.missed_rounds,
+            "solo_rounds": self.solo_rounds,
+            "last_group_size": self.last_group_size,
+        }
+
+
+def serve(
+    *,
+    stage: str,
+    index: int,
+    learning_rate: float = LEARNING_RATE,
+    stats_interval: float | None = None,
+    max_batch_size: int = BATCH_SIZE,
+    activation_precision: str = "fp32",
+    gradient_precision: str = "fp32",
+) -> tuple[hivemind.DHT, Server, StageBackend]:
+    """Start a worker hosting ``<stage>.<index>`` and return its parts.
+
+    The worker joins the all-reduce group for its stage and waits to be told
+    when to step: the trainer signals each round over the control channel, and
+    the replicas sharing a stage each contribute whatever they were dealt
+    before they average and step together. Nothing here decides the interval -
+    that is the trainer's ``--batches-per-reduce``.
+
+    A stage needs at least two replicas serving it. hivemind's matchmaking will
+    not close a group of one, so a lone worker accumulates, is signalled, and
+    times out the round.
+
+    The caller owns the lifetime: call ``server.shutdown()`` to stop, which also
+    shuts down the DHT it was given, and ``backend.shutdown_averaging()``.
+    """
+    uid = f"{stage}.{index}"
+    if not is_valid_uid(uid):
+        raise ValueError(f"{uid!r} is not a valid hivemind expert uid (expected <prefix>.<int>)")
+    if stage not in STAGE_SHAPES:
+        raise ValueError(f"unknown stage {stage!r}; known stages: {sorted(STAGE_SHAPES)}")
+
+    logger = configure_logging(f"worker[{uid}]")
+
+    module = build_stage(stage, SEED)
+
+    dht_kwargs = {"host_maddrs": HOST_MADDRS, "start": True}
+    dht = hivemind.DHT(**dht_kwargs)
+
+    # The key is namespaced by stage, so stage0's replicas form one all-reduce
+    # group and stage1's form another. They never mix.
+    grad_averager = GradientAverager(
+        module.parameters(),
+        dht=dht,
+        prefix=f"{stage}_grads",
+        # High matchmaking per round can dominate wall-clock for small local
+        # runs; the ordering constraint between these two is in constants.py.
+        min_matchmaking_time=MIN_MATCHMAKING_TIME,
+        request_timeout=REQUEST_TIMEOUT,
+        # Types the gradients on the replica all-reduce, and nothing else:
+        # accumulation and Adam stay float32 whatever this says.
+        compression=GRADIENT_PRECISIONS[gradient_precision],
+        # Set this to the number of replicas hosting the stage and an
+        # all-reduce round closes the moment they have all arrived, instead
+        # of waiting out the declared expiration: hivemind's shortcut in
+        # matchmaking.py
+        # Fine to set for static reliable case, which is what this PoC builds
+        target_group_size=REPLICAS_PER_STAGE,
+        start=True,
+    )
+
+    in_shape, out_shape = STAGE_SHAPES[stage]
+    # Types every tensor on the trainer/worker RPCs. hivemind publishes the
+    # schema, so declaring it here also makes the trainer serialise to match -
+    # args_schema covers the forward request, the input re-sent on backward and
+    # the backward response; outputs_schema covers the forward response and the
+    # output gradients sent on backward. Between them, all four legs.
+    activations = ACTIVATION_PRECISIONS[activation_precision]
+    backend = StageBackend(
+        uid,
+        module,
+        optimizer=torch.optim.Adam(module.parameters(), lr=learning_rate),
+        args_schema=(BatchTensorDescriptor(*in_shape, compression=activations),),
+        outputs_schema=BatchTensorDescriptor(*out_shape, compression=activations),
+        grad_averager=grad_averager,
+        max_batch_size=max_batch_size, # processing multiple batches at once affects the average loss calculation
+    )
+
+    # `device` and `stats_report_interval` are Runtime parameters; Server forwards
+    # its surplus kwargs straight through to the Runtime it constructs.
+    server = Server(
+        dht,
+        {uid: backend},
+        num_connection_handlers=NUM_WORKER_HANDLERS,
+        update_period=WORKER_SERVER_UPDATE_PERIOD,
+        device=torch.device("cpu"),
+        stats_report_interval=stats_interval,
+        start=True,
+    )
+
+    # Registered here, in the worker's MAIN process, so the handler shares
+    # memory with the Runtime thread that owns the accumulators. See the module
+    # docstring in control.py for why a ConnectionHandler cannot.
+    backend.control = ControlServer(dht, backend, uid)
+    backend.control.start()
+
+    logger.info("hosting %s (%d parameters)", uid, sum(p.numel() for p in module.parameters()))
+    logger.info("all-reduce group %r, rounds triggered by the trainer", stage)
+    logger.info("peer id %s, dht child pid %s", dht.peer_id, dht.pid)
+    logger.info("trainers join with: --initial-peers %s", dht.get_visible_maddrs()[0])
+
+    return dht, server, backend
+
+
+def dump_parameters(backend: StageBackend, stage: str, index: int) -> Path:
+    """Write this stage's final weights to ``results/worker_<stage>_<index>_<ts>.json``.
+
+    The system's central claim is that two replicas of a stage never exchange
+    parameters and stay identical anyway, because they apply the same averaged
+    gradient to the same starting point. Each worker states its final position and
+    ``python -m swarm_mlp.distributed_training`` checks the pairs.
+
+    Values are flattened and the shape recorded beside them - a 256x784 matrix
+    as nested lists costs several times more to write and to parse, and the
+    checker only ever walks them in order.
+    """
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = RESULTS_DIR / f"worker_{stage}_{index}_{time.strftime(CURVE_TIMESTAMP_FORMAT)}.json"
+    payload = {
+        "stage": stage,
+        "index": index,
+        "steps": backend.steps,
+        "averaging_rounds": backend.averaging_rounds,
+        "samples_total": backend.samples_total,
+        "params": {
+            name: {"shape": list(param.shape), "values": param.detach().flatten().tolist()}
+            for name, param in backend.module.named_parameters()
+        },
+    }
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="python -m swarm_mlp.distributed_training.worker",
+        description="Host one pipeline stage of SimpleMLP as a hivemind peer.",
+    )
+    parser.add_argument("--stage", default="stage0", help="stage name (default: stage0)")
+    parser.add_argument("--index", type=int, default=0, help="replica index within the stage")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=BATCH_SIZE,
+        help="the trainer's batch size; also caps the task pool so concurrent "
+        f"backwards are never merged into one call (default: {BATCH_SIZE})",
+    )
+    parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE)
+    parser.add_argument(
+        "--activation-precision",
+        choices=sorted(ACTIVATION_PRECISIONS),
+        default="fp32",
+        help="wire precision for the trainer/worker RPCs (default: fp32)",
+    )
+    parser.add_argument(
+        "--gradient-precision",
+        choices=sorted(GRADIENT_PRECISIONS),
+        default="fp32",
+        help="wire precision for the replica all-reduce (default: fp32)",
+    )
+    parser.add_argument(
+        "--stats-interval",
+        type=float,
+        default=None,
+        help="seconds between throughput reports (hivemind's and ours); off by default",
+    )
+    parser.add_argument("--log-level", default=None)
+    return parser.parse_args(argv)
+
+
+def main() -> None:
+    args = parse_args()
+    logger = configure_logging(f"worker[{args.stage}.{args.index}]", args.log_level)
+    silence_teardown_noise()
+    enable_int8()
+
+    dht, server, backend = serve(
+        stage=args.stage,
+        index=args.index,
+        learning_rate=args.learning_rate,
+        stats_interval=args.stats_interval,
+        max_batch_size=args.batch_size,
+        activation_precision=args.activation_precision,
+        gradient_precision=args.gradient_precision,
+    )
+    logger.info(
+        "activations %s, gradients %s", args.activation_precision, args.gradient_precision
+    )
+
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.set())
+
+    try:
+        # Wake on the same cadence as the throughput report so our counters can be
+        # read next to hivemind's per-pool numbers rather than minutes apart.
+        while not stop.wait(args.stats_interval or 3600.0):
+            if args.stats_interval:
+                logger.info("stats: %s", backend.get_stats())
+    finally:
+        # Before the dump, so no all-reduce is still in flight: the weights
+        # written below are the ones the last completed round produced.
+        backend.shutdown_averaging()
+        try:
+            logger.info("weights written to %s", dump_parameters(backend, args.stage, args.index))
+        finally:
+            # Nested so a failure to serialise still cannot leave the server and
+            # its p2pd child running.
+            #
+            # Shuts down the DHT too. Expect a second "Server shutdown
+            # successfully" and one "ConnectionHandler ... already dead"
+            # warning: our call makes Runtime.run return, and Server.run's own
+            # finally then shuts down again.
+            server.shutdown()
+        logger.info(
+            "worker stopped after %d steps (%d all-reduce rounds), %d samples",
+            backend.steps,
+            backend.averaging_rounds,
+            backend.samples_total,
+        )
+
+
+if __name__ == "__main__":
+    main()

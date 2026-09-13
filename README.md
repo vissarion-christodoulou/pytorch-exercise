@@ -11,70 +11,53 @@ The system has two services:
   for that stage, and accumulates gradients locally. When the workers in a stage
   collectively reach the target batch size they all-reduce gradients and step.
 - **trainer** — holds no weights. It samples data batches and routes
-  activations and gradients between workers.
+  activations and gradients between workers. It orchestrates load balancing
+  within a stage and triggers all-reduce when the target batch size is reached.
 
-## Setup
 
-Everything runs inside WSL2 Ubuntu. From a WSL shell:
 
-```bash
-./scripts/setup.sh
-source ~/.venvs/pluralis/bin/activate
+
+## Docs
+The following docs cover the scope of the project:
+```
+docs/
+  setup.md              # set up running environment. Prerequisite for other runs
+  referenceBaseline.md  # run SimpleMLP and plot its loss curve
+  trainDistributed.md   # instructions on running a trainer and workers
+  distributedProof.md   # distributed training proof of correctness and comparison of loss curve between distributed and reference
+  ablation.md           # experiment with gradient and activation compression
+  tradeoffs.md          # tradeoffs of the project, generally aiming at simplicity. Gotchas and possible extensions.
+
 ```
 
-See [docs/setup.md](docs/setup.md) for the verified configuration, the reasoning
-behind each choice, and known quirks.
 
-## Verifying the environment
-
-```bash
-python scripts/verify_env.py
-```
-
-Checks that hivemind imports, that two DHT peers can discover each other over
-libp2p, and that a forward/backward round trip through a remotely hosted module
-returns gradients to the caller.
-
-## Reference baseline
-
-Before the distributed system can be judged there has to be something to judge it
-against. The single-process run trains the same `SimpleMLP` on the same MNIST
-pipeline the workers and trainer will use:
-
-```bash
-python -m swarm_mlp
-```
-
-It prints a summary and writes [results/reference_loss.png](results/reference_loss.png).
-Defaults are 3 epochs, batch 64, Adam at 1e-3, seed 0 — all overridable as flags.
-
-Three properties make it usable as a control rather than just a nice graph:
-
-- **Deterministic.** Same seed, same initial weights, same batch order; two runs
-  produce bit-identical curves. The distributed system starts from the same
-  seeded weights and consumes the same data, so the curves should very nearly
-  coincide — a far sharper test than "both trend downwards".
-- **Densely sampled.** Loss is recorded after every optimiser step, not once per
-  epoch. Five points per run cannot separate a subtly wrong all-reduce from
-  noise; a few thousand can.
-- **Plotted against samples consumed**, not step count. Four workers stepping on
-  a shared target-batch-size trigger have no step counter corresponding to this
-  one.
-
-`train_reference()` returns the curve in memory and writes nothing, so the
-eventual comparison script can call it directly.
-
-## Layout
+## Rest of Layout
 
 ```
 scripts/
     setup.sh            # idempotent environment bootstrap
     verify_env.py       # hivemind installation checks
+    ablation_report.py  # builds the wire-precision figure from the five curves
 src/swarm_mlp/
-    model.py            # SimpleMLP, mandated verbatim by the assignment
-    data.py             # MNIST pipeline, shared by reference and trainer
-    reference.py        # single-process baseline -> LossCurve
-    __main__.py         # CLI: run the baseline, plot the curve
+    baseline_reference/
+        __main__.py             # CLI: run the baseline, plot the curve
+        reference.py            # single-process baseline -> LossCurve
+    distributed_training/
+        __main__.py             # Compares saved weights that are saved under results from latest dying workers of the same stage
+        constants.py            # constants not needed by the reference model
+        precision.py            # wire precisions for both channels, and a NumPy 2 fix for 8-bit
+        trainer.py              # the trainer class
+        worker.py               # the worker class
+        control.py              # built on hivermind library to control the communication between a worker and a trainer
+    utils/
+        constants.py            # values shared by the baseline and the distributed system
+        model.py                # SimpleMLP, mandated verbatim by the assignment and functions for building the distributed model
+        data.py                 # MNIST pipeline, shared by reference and trainer
+        observability.py        # logging-specific settings
+        curves.py               # helper for building sample to training error curves
+        plotting.py             # helper for plotting curves
+        compare.py              # used to compare distributed curves to the reference curve
+
 docs/
     setup.md
 results/                # committed plots

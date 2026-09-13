@@ -7,9 +7,9 @@ so everything here exists to make that comparison sharp rather than vague:
 * **Dense sampling.** The loss is recorded after every optimiser step, not once
   per epoch. Five points per run cannot distinguish a subtly wrong all-reduce
   from noise; a few thousand can.
-* **Samples, not steps, on the x-axis.** Four workers stepping on a shared
-  target-batch-size trigger do not have a step counter that corresponds to this
-  one. Samples consumed is the axis both sides can agree on.
+* **Samples, not steps, on the x-axis.** Four workers stepping once per group
+  of batches do not have a step counter that corresponds to this one. Samples
+  consumed is the axis both sides can agree on.
 * **Seeded and reproducible.** Same seed, same initial weights, same batch
   order. If the distributed run starts from the same place and follows the same
   data, the curves should nearly coincide - a much stronger test than "both
@@ -22,67 +22,13 @@ differ between the two implementations.
 
 from __future__ import annotations
 
-import random
-from dataclasses import dataclass, field
-
-import numpy as np
-import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from swarm_mlp.data import mnist_train_loader
-from swarm_mlp.model import SimpleMLP
-
-# Defaults shared by whatever calls this. When the distributed trainer lands it
-# should import these rather than restate them; a silent disagreement about the
-# learning rate would look exactly like a bug in the gradient averaging.
-EPOCHS = 3
-BATCH_SIZE = 64
-LEARNING_RATE = 1e-3
-SEED = 0
-
-
-@dataclass
-class LossCurve:
-    """A training run's loss against the number of samples consumed.
-
-    Held in memory and returned rather than written to disk: the comparison
-    script calls the producing function and plots what comes back.
-    """
-
-    samples: list[int] = field(default_factory=list)
-    loss: list[float] = field(default_factory=list)
-    accuracy: list[float] = field(default_factory=list)
-
-    def record(self, samples: int, loss: float, accuracy: float) -> None:
-        self.samples.append(samples)
-        self.loss.append(loss)
-        self.accuracy.append(accuracy)
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-
-def seed_everything(seed: int) -> None:
-    """Seed every RNG that can affect weight initialisation.
-
-    Data order is *not* covered here - it comes from an explicit generator in
-    ``mnist_train_loader`` - so that the two can be varied independently.
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-
-def build_model(seed: int = SEED, device: str = "cpu") -> SimpleMLP:
-    """A freshly initialised model, deterministic in ``seed``.
-
-    Separate from the training loop because the distributed side will need the
-    same initial weights: workers hold slices of *this* model, seeded this way,
-    so that both runs start from an identical point.
-    """
-    seed_everything(seed)
-    return SimpleMLP().to(device)
+from swarm_mlp.utils.constants import BATCH_SIZE, EPOCHS, LEARNING_RATE, SEED
+from swarm_mlp.utils.curves import LossCurve
+from swarm_mlp.utils.data import mnist_train_loader
+from swarm_mlp.utils.model import build_model
 
 
 def train_reference(
@@ -93,11 +39,16 @@ def train_reference(
     seed: int = SEED,
     device: str = "cpu",
     log_every: int = 100,
+    max_steps: int | None = None,
 ) -> LossCurve:
     """Train ``SimpleMLP`` on MNIST and return its training loss curve.
 
     Computes and returns; writes nothing. Progress goes to stdout so a long run
     is not silent, but the curve itself is the return value.
+
+    ``max_steps`` stops after that many recorded steps, so a comparison against
+    a short distributed run does not have to pay for a full epoch. ``None``
+    means run every epoch to the end.
     """
     model = build_model(seed=seed, device=device)
     loader = mnist_train_loader(batch_size=batch_size, seed=seed)
@@ -105,7 +56,15 @@ def train_reference(
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-    curve = LossCurve()
+    curve = LossCurve(
+        meta={
+            "source": "reference",
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "seed": seed,
+        }
+    )
     samples_seen = 0
 
     model.train()
@@ -135,5 +94,8 @@ def train_reference(
                     f"samples {samples_seen:>6}  loss {loss.item():.4f}  "
                     f"acc {batch_accuracy:.3f}"
                 )
+
+            if max_steps is not None and len(curve) >= max_steps:
+                return curve
 
     return curve

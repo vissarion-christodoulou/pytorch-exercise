@@ -27,7 +27,8 @@ dependencies = [
 dev = ["pytest"]
 
 [project.scripts]
-swarm-mlp = "swarm_mlp.__main__:main"
+swarm-mlp = "swarm_mlp.baseline_reference.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/swarm_mlp"]
+
