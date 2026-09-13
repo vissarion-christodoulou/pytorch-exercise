@@ -36,6 +36,13 @@ import torch.nn as nn
 import hivemind
 from hivemind.moe.server import get_experts
 
+from swarm_mlp.distributed_training.constants import (
+    BATCHES_PER_REDUCE,
+    POLL_INTERVAL_FOR_FREE_WORKER, 
+    REPLICAS_PER_STAGE,
+    RESOLVE_EXPERT_TIMEOUT, 
+    TRAINER_LOG_EVERY
+)
 from swarm_mlp.distributed_training.control import DEFAULT_SIGNAL_TIMEOUT, signal_reduce
 from swarm_mlp.utils.constants import (
     BATCH_SIZE,
@@ -48,8 +55,7 @@ from swarm_mlp.utils.curves import LossCurve
 from swarm_mlp.utils.data import mnist_train_loader
 from swarm_mlp.utils.model import PIPELINE, STAGE_SHAPES
 from swarm_mlp.utils.observability import configure_logging, silence_teardown_noise
-POLL_INTERVAL_FOR_FREE_WORKER = 0.002
-BATCHES_PER_REDUCE = 10
+
 
 
 def resolve_expert(
@@ -120,22 +126,16 @@ class StagePool:
 async def train_pipeline(
     *,
     initial_peers: Sequence[str],
-    stages: Sequence[str] = PIPELINE,
-    replicas: int = 2,
     epochs: int = EPOCHS,
     batch_size: int = BATCH_SIZE,
     batches_per_reduce: int = BATCHES_PER_REDUCE,
-    signal_timeout: float = DEFAULT_SIGNAL_TIMEOUT,
-    seed: int = SEED,
-    max_steps: int | None = None,
-    log_every: int = 50,
     resolve_timeout: float = 60.0,
 ) -> LossCurve:
     """Drive MNIST through a multi-stage, multi-replica pipeline of workers.
 
-    ``stages`` names the pipeline in the order activations flow; ``replicas`` is
-    how many workers host each stage. Every ``<stage>.<r>`` for r in
-    ``range(replicas)`` must already be serving, so the default 2x2 topology
+    ``PIPELINE`` names the pipeline stages in the order activations flow, and
+    ``REPLICAS_PER_STAGE`` workers host each of them. Every ``<stage>.<r>`` for r
+    in ``range(REPLICAS_PER_STAGE)`` must already be serving, so the 2x2 topology
     wants four workers: stage0.0, stage0.1, stage1.0, stage1.1.
 
     **Scheduling.** Batches are processed in groups of ``batches_per_reduce``,
@@ -158,28 +158,26 @@ async def train_pipeline(
     try:
         started = time.monotonic()
         pools = []
-        for stage in stages:
-            if stage not in STAGE_SHAPES:
-                raise ValueError(f"unknown stage {stage!r}; known: {sorted(STAGE_SHAPES)}")
+        for stage in PIPELINE:
             experts = []
-            for replica in range(replicas):
+            for replica in range(REPLICAS_PER_STAGE):
                 uid = f"{stage}.{replica}"
-                expert = resolve_expert(dht, uid, timeout=resolve_timeout)
+                expert = resolve_expert(dht, uid, timeout=RESOLVE_EXPERT_TIMEOUT)
                 logger.info("resolved %s -> %s", uid, expert.peer_id)
                 experts.append(expert)
             pools.append(StagePool(stage, experts))
         logger.info(
             "%d stages x %d replicas resolved in %.1fs; all-reducing every %d batches "
             "(%d samples per stage)",
-            len(stages),
-            replicas,
+            len(PIPELINE),
+            REPLICAS_PER_STAGE,
             time.monotonic() - started,
             batches_per_reduce,
             batches_per_reduce * batch_size,
         )
 
-        in_shape = STAGE_SHAPES[stages[0]][0]
-        loader = mnist_train_loader(batch_size=batch_size, seed=seed)
+        in_shape = STAGE_SHAPES[PIPELINE[0]][0]
+        loader = mnist_train_loader(batch_size=batch_size, seed=SEED)
         criterion = nn.CrossEntropyLoss()
 
         curve = LossCurve(
@@ -188,9 +186,9 @@ async def train_pipeline(
                 "epochs": epochs,
                 "batch_size": batch_size,
                 "learning_rate": None,  # owned by the workers
-                "seed": seed,
-                "stages": list(stages),
-                "replicas": replicas,
+                "seed": SEED,
+                "stages": list(PIPELINE),
+                "replicas": REPLICAS_PER_STAGE,
                 "batches_per_reduce": batches_per_reduce,
                 "target_batch_size": batches_per_reduce * batch_size,
                 "note": (
@@ -215,7 +213,7 @@ async def train_pipeline(
             if tuple(images.shape[1:]) != in_shape:
                 raise ValueError(
                     f"batch shape {tuple(images.shape)} does not match "
-                    f"stage {stages[0]!r} input {in_shape}"
+                    f"stage {PIPELINE[0]!r} input {in_shape}"
                 )
 
             # RemoteExpert.forward and Tensor.backward are blocking: hivemind hands
@@ -239,9 +237,9 @@ async def train_pipeline(
             results[ordinal] = (labels.size(0), loss.item(), accuracy)
 
             completed += 1
-            if log_every and completed % log_every == 0:
+            if completed % TRAINER_LOG_EVERY == 0:
                 now = time.monotonic()
-                rate = log_every / max(now - window_started, 1e-9)
+                rate = TRAINER_LOG_EVERY / max(now - window_started, 1e-9)
                 window_started = now
                 logger.info(
                     "batch %5d  loss %.4f  acc %.3f  (%.1f batches/s)  load %s",
@@ -270,7 +268,7 @@ async def train_pipeline(
             acks = await asyncio.gather(
                 *(
                     asyncio.wrap_future(
-                        signal_reduce(dht, e.peer_id, e.uid, round_id, signal_timeout)
+                        signal_reduce(dht, e.peer_id, e.uid, round_id, DEFAULT_SIGNAL_TIMEOUT)
                     )
                     for e in experts
                 ),
@@ -309,8 +307,6 @@ async def train_pipeline(
         for epoch in range(epochs):
             group: list[tuple[int, object, object]] = []
             for images, labels in loader:
-                if max_steps is not None and ordinal >= max_steps:
-                    break
                 group.append((ordinal, images, labels))
                 ordinal += 1
                 if len(group) < batches_per_reduce:
@@ -320,15 +316,15 @@ async def train_pipeline(
                 round_id += 1
                 group = []
             if group:
-                # A trailing group shorter than `replicas` cannot give every
-                # replica a batch, and a replica with no samples declines the
-                # reduce signal - leaving the ones that did get work to wait out
-                # the full averaging_timeout on a group that can never reach
-                # hivemind's min_group_size of 2. Skipping it costs at most
-                # replicas-1 batches per epoch; running it costs a 120s stall
-                # and a failed round. Groups of `replicas` or more need no such
-                # guard: StagePool hands out every replica before repeating.
-                if len(group) >= replicas:
+                # A trailing group shorter than REPLICAS_PER_STAGE cannot
+                # give every replica a batch, and a replica with no samples
+                # declines the reduce signal - leaving the ones that did get work
+                # to wait out the full averaging_timeout on a group that can
+                # never reach hivemind's min_group_size of 2. Skipping it costs
+                # at most REPLICAS_PER_STAGE-1 batches per epoch; running it
+                # costs a 120s stall and a failed round. Longer groups need no
+                # such guard: StagePool hands out every replica before repeating.
+                if len(group) >= REPLICAS_PER_STAGE:
                     await _run_group(group, process_batch)
                     await signal_group_complete(round_id)
                     round_id += 1
@@ -337,7 +333,7 @@ async def train_pipeline(
                         "dropping a trailing group of %d batches: fewer than the "
                         "%d replicas that must each contribute to a round",
                         len(group),
-                        replicas,
+                        REPLICAS_PER_STAGE,
                     )
 
         for key in sorted(results):
@@ -371,19 +367,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Sample MNIST batches and drive them through a remote stage.",
     )
     parser.add_argument("--initial-peers", nargs="+", required=True, help="multiaddrs of live peers")
-    parser.add_argument(
-        "--stages",
-        nargs="+",
-        default=list(PIPELINE),
-        help=f"pipeline stages in flow order (default: {' '.join(PIPELINE)})",
-    )
-    parser.add_argument(
-        "--replicas",
-        type=int,
-        default=2,
-        help="workers hosting each stage; every <stage>.r for r in range(N) "
-        "must already be serving (default: 2)",
-    )
     parser.add_argument("--epochs", type=int, default=EPOCHS)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument(
@@ -394,9 +377,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "outright - the workers accumulate until told, so nothing needs to be "
         "kept in sync with them (default: 10)",
     )
-    parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--max-steps", type=int, default=None)
-    parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument(
         "--output",
         type=Path,
@@ -425,14 +405,9 @@ def main() -> None:
     curve = asyncio.run(
         train_pipeline(
             initial_peers=args.initial_peers,
-            stages=args.stages,
-            replicas=args.replicas,
             epochs=args.epochs,
             batch_size=args.batch_size,
-            batches_per_reduce=args.batches_per_reduce,
-            seed=args.seed,
-            max_steps=args.max_steps,
-            log_every=args.log_every,
+            batches_per_reduce=args.batches_per_reduce
         )
     )
 

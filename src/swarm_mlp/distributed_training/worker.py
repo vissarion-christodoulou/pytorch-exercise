@@ -44,6 +44,7 @@ from hivemind.optim.grad_averager import GradientAverager
 from hivemind.utils import BatchTensorDescriptor
 from hivemind.utils.logging import get_logger
 
+from swarm_mlp.distributed_training.constants import NUM_WORKER_HANDLERS, REPLICAS_PER_STAGE
 from swarm_mlp.distributed_training.control import ControlServer
 from swarm_mlp.utils.constants import BATCH_SIZE, LEARNING_RATE, SEED
 from swarm_mlp.utils.model import STAGE_SHAPES, build_stage
@@ -368,7 +369,7 @@ class StageBackend(ModuleBackend):
         self.grad_averager.shutdown()
 
     def get_stats(self) -> dict[str, int]:
-        """Counters for the periodic report under ``--stats-interval``, and for tests."""
+        """Counters for the periodic report under ``--stats-interval``"""
         return {
             "steps": self.steps,
             "samples_total": self.samples_total,
@@ -392,13 +393,11 @@ def serve(
     identity_path: str | None = None,
     learning_rate: float = LEARNING_RATE,
     seed: int = SEED,
-    num_handlers: int = 2,
     update_period: float = 5.0,
     stats_interval: float | None = None,
     max_batch_size: int = BATCH_SIZE,
     min_matchmaking_time: float = 0.05,
     request_timeout: float = 0.04,
-    target_group_size: int | None = None,
     averaging_timeout: float = 120.0,
 ) -> tuple[hivemind.DHT, Server, StageBackend]:
     """Start a worker hosting ``<stage>.<index>`` and return its parts.
@@ -462,7 +461,7 @@ def serve(
         # of waiting out the declared expiration: hivemind's shortcut in
         # matchmaking.py
         # Fine to set for static reliable case, which is what this PoC builds
-        target_group_size=target_group_size,
+        target_group_size=REPLICAS_PER_STAGE,
         start=True,
     )
 
@@ -483,7 +482,7 @@ def serve(
     server = Server(
         dht,
         {uid: backend},
-        num_connection_handlers=num_handlers,
+        num_connection_handlers=NUM_WORKER_HANDLERS,
         update_period=update_period,
         device=torch.device("cpu"),
         stats_report_interval=stats_interval,
@@ -523,7 +522,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE)
     parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--num-handlers", type=int, default=2)
     parser.add_argument("--update-period", type=float, default=5.0)
     parser.add_argument(
         "--min-matchmaking-time",
@@ -537,15 +535,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=1,
         help="seconds for a single matchmaking request (hivemind default: 3)",
-    )
-    parser.add_argument(
-        "--target-group-size",
-        type=int,
-        default=2,
-        help="number of workers hosting this stage; a round then closes as soon "
-        "as that many have joined. Measured 32x faster, but it turns a late "
-        "replica from a wait into a failed round, so it is off by default until "
-        "the trainer synchronises arrival",
     )
     parser.add_argument("--averaging-timeout", type=float, default=120.0)
     parser.add_argument(
@@ -571,13 +560,11 @@ def main() -> None:
         identity_path=args.identity_path,
         learning_rate=args.learning_rate,
         seed=args.seed,
-        num_handlers=args.num_handlers,
         update_period=args.update_period,
         stats_interval=args.stats_interval,
         max_batch_size=args.batch_size,
         min_matchmaking_time=args.min_matchmaking_time,
         request_timeout=args.request_timeout,
-        target_group_size=args.target_group_size,
         averaging_timeout=args.averaging_timeout,
     )
 
