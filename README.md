@@ -106,7 +106,7 @@ I have opted for simplicity in a number of cases to focus on producing a Proof o
   <li>Assuming static 2x2 model throughout (harming generalization)
 </li>
   <li>The all-reduce is triggered once all stages are done propagating (harming speed)</li>
-  <li>A worker crashing or losing synchronization with peers causes the trainer to do and lives other workers "orphaned"</li>
+  <li>A worker crashing or losing synchronization with peers causes the trainer to do and lives other workers "orphaned" (harming reliability)</li>
 </ol>
 
 
