@@ -12,7 +12,7 @@ The system has two services:
   collectively reach the target batch size they all-reduce gradients and step.
 - **trainer** — holds no weights. It samples data batches and routes
   activations and gradients between workers. It orchestrates load balancing
-  within a stage and triggers all-reduce when the target bach size is reached.
+  within a stage and triggers all-reduce when the target batch size is reached.
 
 ## Setup
 
@@ -132,6 +132,8 @@ src/swarm_mlp/
         __main__.py             # CLI: run the baseline, plot the curve
         reference.py            # single-process baseline -> LossCurve
     distributed_training/
+        __main__.py             # Compares saved weights that are saved under results from latest dying workers of the same stage
+        constants.py            # constants not needed by the reference model
         trainer.py              # the trainer class
         worker.py               # the worker class
         control.py              # built on hivermind library to control the communication between a worker and a trainer
