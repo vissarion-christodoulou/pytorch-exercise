@@ -232,17 +232,6 @@ class StageBackend(ModuleBackend):
         # only if that gather comes back in a shape we cannot sum.
         group_samples = local_samples
 
-        # Deliberately no "skip averaging if we look alone" shortcut here.
-        # There is no cheap way to learn the group size before matchmaking has
-        # run, and guessing is worse than waiting: stepping locally because a
-        # peer had not been discovered yet diverges the replicas permanently
-        # and nothing ever pulls them back together (measured: 6.3e-3 drift
-        # where averaging gives <1e-6). Whether we averaged is decided by the
-        # averaging result below, never by a guess made beforehand. A genuinely
-        # stage with only one replica running cannot close a group at all, and
-        # the round fails on the timeout and is reported rather than silently
-        # corrupting the weights.
-
         # Finish the mean ourselves, then give the averager a single
         # accumulation of it: with one call the anchor equals the batch size and
         # the call count is 1, so both of hivemind's internal scalings collapse
@@ -262,10 +251,7 @@ class StageBackend(ModuleBackend):
             # gradient equal to the gradient of the mean loss over every sample
             # the group saw, however unevenly they were split.
             # The return value is the gathered data from everyone in the group,
-            # so its length is the REAL group size. Nothing cheaper is: a
-            # DHT-gossiped peer count was quietly reporting 2 on rounds that
-            # had in fact averaged with nobody, which is why the group size is
-            # taken from the round itself and from nowhere else.
+            # so its length is the REAL group size.
             # `gather` rides along with matchmaking and comes back as a dict of
             # peer -> that peer's payload, so sending our own sample count is
             # what lets every replica report the TRUE collective batch size
@@ -479,36 +465,16 @@ def serve(
         module.parameters(),
         dht=dht,
         prefix=f"{stage}_grads",
-        # hivemind's default is 5s of matchmaking per round, which dominates
-        # wall-clock on a local run that averages every few hundred samples.
-        # It cannot be lowered blindly though: hivemind requires
-        # request_timeout < min_matchmaking_time and warns that otherwise
-        # "matchmaking can cause deadlocks". Lowering only the matchmaking
-        # window inverted that ordering against the 3s default request
-        # timeout, and rounds duly started failing - so both move together.
+        # High matchmaking per round can dominate wall-clock for small local 
+        # runs. But it must be at least request_timeout to avoid matchmaking
+        # deadlocks in hivemind
         min_matchmaking_time=min_matchmaking_time,
         request_timeout=request_timeout,
         # Set this to the number of replicas hosting the stage and an
         # all-reduce round closes the moment they have all arrived, instead
         # of waiting out the declared expiration: hivemind's shortcut in
-        # matchmaking.py is guarded by `target_group_size is not None and
-        # len(followers) + 1 >= it`, so the default of None disables it.
-        #
-        # It is a big win and a real risk, and which one you get depends
-        # entirely on how tightly the replicas arrive. Measured on the 2x2
-        # topology:
-        #   batches_per_reduce=10, 60 batches
-        #     None -> 110.66s, 4 of 8 rounds failed on timeout
-        #     2    ->   3.38s, 16 of 16 rounds clean        (32x faster)
-        #   batches_per_reduce=4, 24 batches (the integration test)
-        #     None -> passes
-        #     2    -> AllreduceException: could not find a group
-        #
-        # The difference is arrival skew. None tolerates a late replica by
-        # waiting; a target group size turns that wait into a hard failure.
-        # So this stays off by default until the trainer synchronises
-        # arrival - at which point it is the single largest speedup
-        # available, since averaging is ~90% of wall clock.
+        # matchmaking.py
+        # Fine to set for static reliable case, which is what this PoC builds
         target_group_size=target_group_size,
         start=True,
     )
@@ -522,18 +488,7 @@ def serve(
         outputs_schema=BatchTensorDescriptor(*out_shape),
         grad_averager=grad_averager,
         averaging_timeout=averaging_timeout,
-        min_batch_size=1,
-        # One trainer batch per call, deliberately. hivemind's TaskPool groups
-        # whatever requests are queued together up to max_batch_size, and the
-        # trainer issues backwards concurrently, so a generous cap really does
-        # merge them (measured: one 128-sample call out of 79 in a 2x2 run).
-        # A merged call is unrecoverable for us: autograd sums contributions
-        # that were each normalised by their own sub-batch, so param.grad is
-        # (1/b)*G_total rather than (1/B)*G_total, and there is no way to
-        # recover the individual b's afterwards. Capping at the trainer's batch
-        # size makes `total_size + task_size > max_batch_size` fire on the
-        # second task, so every call is exactly one batch.
-        max_batch_size=max_batch_size,
+        max_batch_size=max_batch_size, # processing multiple batches at once affects the average loss calculation
     )
 
     # `device` and `stats_report_interval` are Runtime parameters; Server forwards
@@ -586,20 +541,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--min-matchmaking-time",
         type=float,
-        default=0.05,
+        default=2,
         help="seconds each all-reduce round spends looking for peers (hivemind default: 5); "
         "must be larger than --request-timeout",
     )
     parser.add_argument(
         "--request-timeout",
         type=float,
-        default=0.04,
+        default=1,
         help="seconds for a single matchmaking request (hivemind default: 3)",
     )
     parser.add_argument(
         "--target-group-size",
         type=int,
-        default=None,
+        default=2,
         help="number of workers hosting this stage; a round then closes as soon "
         "as that many have joined. Measured 32x faster, but it turns a late "
         "replica from a wait into a failed round, so it is off by default until "
