@@ -1,8 +1,8 @@
-distributed:   results/distributed_pipeline_20260913-111508.json
+distributed:   results/distributed_pipeline_20260913-185035.json
 reference:     recomputed from the distributed run metadata
 common prefix: 282 steps
 max |delta loss| = 4.071e-04   mean |delta loss| = 5.336e-05   first step over 0.001: none
 reference   final 50-step mean loss 0.1741
 distributed final 50-step mean loss 0.1742
-plot written to /mnt/c/Users/Vissarion/Desktop/pytorch-exercise/results/compare_pipeline_20260913-111508.png
+plot written to /mnt/c/Users/Vissarion/Desktop/pytorch-exercise/results/compare_pipeline_20260913-185035.png
 PASS (tolerance 0.001)

@@ -454,16 +454,8 @@ def dump_parameters(backend: StageBackend, stage: str, index: int) -> Path:
 
     The system's central claim is that two replicas of a stage never exchange
     parameters and stay identical anyway, because they apply the same averaged
-    gradient to the same starting point. That is a claim about the weights, and
-    the logs cannot settle it - a round that silently stepped on an unaveraged
-    gradient still logs a step. So each worker states its final position and
+    gradient to the same starting point. Each worker states its final position and
     ``python -m swarm_mlp.distributed_training`` checks the pairs.
-
-    JSON rather than a state dict, because the point is to be readable by
-    something that is not this program. The format loses nothing: a float32
-    widens to a Python float losslessly, and ``json`` writes ``repr()``, which
-    parses back to the same double. So any difference the checker reports is a
-    difference between the workers, never an artefact of writing them down.
 
     Values are flattened and the shape recorded beside them - a 256x784 matrix
     as nested lists costs several times more to write and to parse, and the

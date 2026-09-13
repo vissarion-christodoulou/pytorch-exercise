@@ -14,11 +14,7 @@ unaveraged gradient) still writes a perfectly ordinary-looking step to the log.
 The weights are where it shows.
 
 The bar is float32 rounding, not exact equality, and that is a fact about
-hivemind rather than a concession. Its all-reduce ships *deltas*: the reducing
-peer returns ``averaged - yours`` and ``DecentralizedAverager`` applies it with
-``tensor.add_(update)``. Each replica therefore computes ``x + (avg - x)``,
-which equals ``avg`` only up to rounding - and the rounding depends on ``x``,
-which differs between replicas by design, since they averaged different samples.
+hivemind rather than a concession. 
 About a fifth of the values end up one ULP apart on every single round.
 
 So the question is whether the gap stays at rounding level or compounds. Real
@@ -162,13 +158,24 @@ def main() -> int:
         for stage in PIPELINE
         for index in range(REPLICAS_PER_STAGE)
     }
+
+    summary: list[str] = []
+
+    def emit(line: str) -> None:
+        """Print a line and keep it, so stdout and the report cannot disagree."""
+        print(line)
+        summary.append(line)
+
+    # The four filenames go in the report before any number does. A verdict
+    # about "the replicas" is worthless without a record of which four files it
+    # actually read - especially here, where the four stamps need not match.
     for (stage, index), path in dumps.items():
-        print(f"{stage}.{index}  {path.name}")
+        emit(f"{stage}.{index}  {path.name}")
 
     stamps = [stamp_of(path) for path in dumps.values()]
     spread = (max(stamps) - min(stamps)).total_seconds()
     if spread > SUSPICIOUS_SPREAD_SECONDS:
-        print(
+        emit(
             f"\nWARNING: these dumps span {spread:.0f}s, so they may not be one run. "
             f"Pass a timestamp to pin the run down."
         )
@@ -180,30 +187,42 @@ def main() -> int:
         problems, measurements = compare(loaded[0], loaded[1])
 
         names = " vs ".join(f"{d['stage']}.{d['index']}" for d in loaded)
-        print(f"\n{stage}: {names}")
-        print(f"  steps {sorted(steps)}, samples {[d['samples_total'] for d in loaded]}")
+        emit(f"\n{stage}: {names}")
+        emit(f"  steps {sorted(steps)}, samples {[d['samples_total'] for d in loaded]}")
         for measurement in measurements:
-            print(f"  {measurement}")
+            emit(f"  {measurement}")
         if problems:
             failures += 1
-            print("  DIVERGED - this is larger than float32 rounding can explain:")
+            emit("  DIVERGED - this is larger than float32 rounding can explain:")
             for problem in problems:
-                print(f"    {problem}")
+                emit(f"    {problem}")
         else:
-            print("  agree to within float32 rounding")
+            emit("  agree to within float32 rounding")
         if len(steps) > 1:
             # Not a mismatch on its own: a replica can be signalled a round it
             # had no samples for and correctly decline to step. Worth printing
             # next to identical weights, though, because the two together say
             # the decline was handled right.
-            print(f"  note: replicas took different numbers of steps ({sorted(steps)})")
+            emit(f"  note: replicas took different numbers of steps ({sorted(steps)})")
 
-    print()
+    emit("")
     if failures:
-        print(f"FAIL: {failures} of {len(PIPELINE)} stages diverged")
-        return 1
-    print(f"PASS: the replicas of all {len(PIPELINE)} stages stayed in lockstep")
-    return 0
+        emit(f"FAIL: {failures} of {len(PIPELINE)} stages diverged")
+        status = 1
+    else:
+        emit(f"PASS: the replicas of all {len(PIPELINE)} stages stayed in lockstep")
+        status = 0
+
+    # Stamped from the first worker in PIPELINE order rather than from the
+    # argument, which is optional and, when given, names a run rather than any
+    # one file. Picking a real dump's stamp means the report is always named
+    # after something that exists on disk.
+    stamp = stamp_of(dumps[(PIPELINE[0], 0)]).strftime(CURVE_TIMESTAMP_FORMAT)
+    report = RESULTS_DIR / f"distributed_{stamp}.txt"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("\n".join(summary) + "\n", encoding="utf-8")
+    print(f"summary written to {report}")
+    return status
 
 
 if __name__ == "__main__":

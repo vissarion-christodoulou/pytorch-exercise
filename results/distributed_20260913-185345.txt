@@ -1,0 +1,20 @@
+stage0.0  worker_stage0_0_20260913-185345.json
+stage0.1  worker_stage0_1_20260913-185347.json
+stage1.0  worker_stage1_0_20260913-185353.json
+stage1.1  worker_stage1_1_20260913-185355.json
+
+stage0: stage0.0 vs stage0.1
+  steps [282], samples [89888, 90112]
+  1.weight: 57153/200704 values differ, max |delta| 5.588e-08 = 5.6e-05 of one optimiser step
+  1.bias: 114/256 values differ, max |delta| 1.118e-08 = 1.1e-05 of one optimiser step
+  agree to within float32 rounding
+
+stage1: stage1.0 vs stage1.1
+  steps [282], samples [90016, 89984]
+  0.weight: 9794/32768 values differ, max |delta| 1.099e-07 = 1.1e-04 of one optimiser step
+  0.bias: 35/128 values differ, max |delta| 7.451e-09 = 7.5e-06 of one optimiser step
+  2.weight: 273/1280 values differ, max |delta| 1.863e-08 = 1.9e-05 of one optimiser step
+  2.bias: 3/10 values differ, max |delta| 1.863e-09 = 1.9e-06 of one optimiser step
+  agree to within float32 rounding
+
+PASS: the replicas of all 2 stages stayed in lockstep
