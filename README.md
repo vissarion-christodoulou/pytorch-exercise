@@ -124,5 +124,6 @@ src/swarm_mlp/
 docs/
     setup.md
 results/                # committed plots
+tests/                  # ai-generated and used mostly as intermediate helpers when developing
 requirements.lock.txt   # exact pins for the verified environment
 ```
