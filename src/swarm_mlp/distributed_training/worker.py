@@ -176,13 +176,11 @@ class StageBackend(ModuleBackend):
             if self._stopping.is_set():
                 return {"reduced": False, "reason": "worker is shutting down"}
             if self.samples_since_step == 0:
-                # Nothing arrived for this worker in that group. Not an error:
-                # with free-worker selection the trainer may legitimately have
-                # given every batch to our peer. Returning instead of averaging
-                # is also what keeps us out of a round we would contribute
-                # nothing to - a group in which every peer has weight zero
-                # divides by zero inside hivemind and yields NaN gradients
-                # silently, with no exception and no log line.
+                # Nothing arrived for this worker in that group, For static 
+                # 2x2 model that's fine, because a step of the other worker 
+                # would find itself alone in the gradient_averager after matchmaking
+                # timeout and would drop its work. Trainer avoids this case that
+                # would waste time
                 self.last_round = round_id
                 return {"reduced": False, "reason": "no samples accumulated", "round": round_id}
 
