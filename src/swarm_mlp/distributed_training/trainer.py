@@ -317,13 +317,9 @@ async def train_pipeline(
                 group = []
             if group:
                 # A trailing group shorter than REPLICAS_PER_STAGE cannot
-                # give every replica a batch, and a replica with no samples
-                # declines the reduce signal - leaving the ones that did get work
-                # to wait out the full averaging_timeout on a group that can
-                # never reach hivemind's min_group_size of 2. Skipping it costs
-                # at most REPLICAS_PER_STAGE-1 batches per epoch; running it
-                # costs a 120s stall and a failed round. Longer groups need no
-                # such guard: StagePool hands out every replica before repeating.
+                # give every replica a batch, which makes stepping harder.
+                # Quick and dirty solution: skip a tail of at most
+                # REPLICAS_PER_STAGE-1 batches
                 if len(group) >= REPLICAS_PER_STAGE:
                     await _run_group(group, process_batch)
                     await signal_group_complete(round_id)
